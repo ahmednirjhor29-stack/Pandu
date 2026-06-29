@@ -19,7 +19,8 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QWidget, QLabel, QFileDialog,
     QPushButton, QLineEdit, QComboBox, QHBoxLayout, QMessageBox,
     QProgressBar, QScrollArea, QInputDialog, QStackedWidget, QTableWidget,
-    QTableWidgetItem, QHeaderView, QDialog, QTextEdit, QFrame, QSizePolicy
+    QTableWidgetItem, QHeaderView, QDialog, QTextEdit, QFrame, QSizePolicy,
+    QSplitter
 )
 from PyQt6.QtGui import QIcon, QPixmap, QColor, QFont, QTextCursor
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer
@@ -138,7 +139,6 @@ class PermissionManager:
         """Try to grant read access. Returns (success, needs_password, error_msg)."""
         if cls.check_readable(path):
             return True, False, ""
-        # Try chmod without sudo first
         try:
             original_mode = os.stat(path).st_mode
             os.chmod(path, original_mode | stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
@@ -149,7 +149,6 @@ class PermissionManager:
                 return True, False, ""
         except PermissionError:
             pass
-        # Need sudo
         if password is None:
             return False, True, "Password required"
         try:
@@ -433,21 +432,25 @@ class TerminalWorker(QThread):
     def __init__(self, command):
         super().__init__()
         self.command = command
+        self._process = None
     def run(self):
         if not self.command:
             self.finished_signal.emit()
             return
         try:
-            process = subprocess.Popen(
+            self._process = subprocess.Popen(
                 self.command, shell=True, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, text=True, bufsize=1)
-            for line in process.stdout:
+            for line in self._process.stdout:
                 self.output_ready.emit(line)
-            process.stdout.close()
-            process.wait()
+            self._process.stdout.close()
+            self._process.wait()
         except Exception as e:
             self.output_ready.emit(f"Shell execution error: {str(e)}\n")
         self.finished_signal.emit()
+    def kill(self):
+        if self._process and self._process.poll() is None:
+            self._process.kill()
 
 # ── Shared UI Helpers ─────────────────────────────────────────────────────────
 
@@ -522,7 +525,7 @@ class SecurityWarningDialog(QDialog):
     def __init__(self, concerns, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Security Warning")
-        self.setFixedSize(500, 300)
+        self.setFixedSize(550, 400)
         self.setModal(True)
         layout = QVBoxLayout(self)
         warn_lbl = QLabel("⚠  Security Notice")
@@ -771,11 +774,7 @@ class LibraryPage(QWidget):
         chg.clicked.connect(lambda: self.migrate(QFileDialog.getExistingDirectory(self, "Select Folder"), "library"))
         df = QPushButton("🔄 Reset Library Default")
         df.clicked.connect(lambda: self.migrate(DEFAULT_DB_DIR, "library"))
-        chg_ai = QPushButton("📂 Change AI Dir")
-        chg_ai.clicked.connect(lambda: self.migrate(QFileDialog.getExistingDirectory(self, "Select Folder"), "ai"))
-        df_ai = QPushButton("🔄 Reset AI Default")
-        df_ai.clicked.connect(lambda: self.migrate(DEFAULT_AI_DB_DIR, "ai"))
-        for w in [ref, QFrame(), chg, df, QFrame(), chg_ai, df_ai]:
+        for w in [ref, QFrame(), chg, df]:
             if isinstance(w, QFrame):
                 w.setFrameShape(QFrame.Shape.VLine); w.setFrameShadow(QFrame.Shadow.Sunken)
             top.addWidget(w)
@@ -879,6 +878,11 @@ class ChatBubble(QFrame):
 # ── AI Analysis Page ──────────────────────────────────────────────────────────
 
 class AIAnalysisPage(QWidget):
+    progress_updated = pyqtSignal(int)  # percentage of analysis progress
+    analysis_completed = pyqtSignal(bool)  # True when analysis done
+    analysis_paused_state = pyqtSignal(bool)  # True when paused
+    analysis_stopped_state = pyqtSignal(bool)  # True when stopped
+
     def __init__(self):
         super().__init__()
         self._ai_mode = CURRENT_SETTINGS.get("ai_mode", "local")
@@ -889,6 +893,12 @@ class AIAnalysisPage(QWidget):
         self._local_chat_thread = None
         self._gemini_worker = None
         self._image_analysis_worker = None
+        self._analysis_paused = False
+        self._analysis_stopped = False
+        self._analysis_result_buffer = ""
+        self._analysis_total_chunks = 0
+        self._analysis_chunks_received = 0
+        self._analysis_saved_count = 0
         self.setup_ui()
         self.status_timer = QTimer(self)
         self.status_timer.timeout.connect(self.check_ollama_status)
@@ -1024,23 +1034,38 @@ class AIAnalysisPage(QWidget):
             "QTextEdit { background: #0a0a0a; border: 1px solid #1e1e1e; color: #cccccc; font-family: 'Segoe UI'; }")
         lay.addWidget(self.analysis_prompt_input)
 
+        # Analyse, Pause, Stop buttons in a row
+        btn_row = QHBoxLayout()
         analyse_btn = QPushButton("▶  Analyse Image with AI")
         analyse_btn.setStyleSheet(
             "QPushButton { background: #0a1020; border: 1px solid #1a3060; color: #4488ff; font-weight: bold; padding: 6px; }"
             "QPushButton:hover { background: #0d1830; border-color: #2255aa; }"
             "QPushButton:disabled { color: #222; border-color: #111; background: #080808; }")
         analyse_btn.clicked.connect(self.run_image_analysis)
-        lay.addWidget(analyse_btn)
+        btn_row.addWidget(analyse_btn, 3)
         self.analyse_btn = analyse_btn
 
-        # Analysis output
-        lay.addWidget(self._sec("ANALYSIS OUTPUT"))
-        self.analysis_output = QTextEdit()
-        self.analysis_output.setReadOnly(True)
-        self.analysis_output.setFixedHeight(120)
-        self.analysis_output.setStyleSheet(
-            "QTextEdit { background: #030f0f; border: 1px solid #007799; color: #7fffee; font-family: 'Consolas', monospace; }")
-        lay.addWidget(self.analysis_output)
+        pause_btn = QPushButton("⏸  Pause")
+        pause_btn.setStyleSheet(
+            "QPushButton { background: #201808; border: 1px solid #604010; color: #ffaa33; font-weight: bold; padding: 6px; }"
+            "QPushButton:hover { background: #302010; }"
+            "QPushButton:disabled { color: #222; border-color: #111; background: #080808; }")
+        pause_btn.clicked.connect(self.pause_analysis)
+        btn_row.addWidget(pause_btn, 1)
+        self.pause_btn = pause_btn
+
+        stop_btn = QPushButton("⏹  Stop")
+        stop_btn.setStyleSheet(
+            "QPushButton { background: #200808; border: 1px solid #501010; color: #ff4444; font-weight: bold; padding: 6px; }"
+            "QPushButton:hover { background: #301010; }"
+            "QPushButton:disabled { color: #222; border-color: #111; background: #080808; }")
+        stop_btn.clicked.connect(self.stop_analysis)
+        btn_row.addWidget(stop_btn, 1)
+        self.stop_btn = stop_btn
+
+        self.pause_btn.setEnabled(False)
+        self.stop_btn.setEnabled(False)
+        lay.addLayout(btn_row)
 
         self.refresh_library_images()
         return frame
@@ -1092,51 +1117,63 @@ class AIAnalysisPage(QWidget):
         body = QHBoxLayout(); body.setSpacing(10)
         left = QVBoxLayout(); left.setSpacing(6)
 
+        # Add scroll area for the left menu
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        left_scroll_content = QWidget()
+        left_scroll_layout = QVBoxLayout(left_scroll_content)
+        left_scroll_layout.setSpacing(6)
+
         card1, l1 = self._card()
         l1.addWidget(self._sec("TARGET SYSTEM PATH"))
         self.ollama_url_input = QLineEdit("http://localhost:11434")
         l1.addWidget(self.ollama_url_input)
-        left.addWidget(card1)
+        left_scroll_layout.addWidget(card1)
 
         card2, l2 = self._card()
         l2.addWidget(self._sec("AVAILABLE ENDPOINTS"))
+        # Make endpoints smaller - side by side with download
+        endpoints_row = QHBoxLayout()
         self.local_models_combo = QComboBox()
-        l2.addWidget(self.local_models_combo)
-        h1 = QHBoxLayout()
-        self.use_local_btn = QPushButton("Target Model")
+        self.local_models_combo.setMinimumWidth(120)
+        endpoints_row.addWidget(self.local_models_combo)
+        self.use_local_btn = QPushButton("Target")
+        self.use_local_btn.setFixedWidth(60)
         self.use_local_btn.clicked.connect(self.target_local_model)
         self.refresh_local_btn = QPushButton("⟳")
-        self.refresh_local_btn.setFixedWidth(32)
+        self.refresh_local_btn.setFixedWidth(28)
         self.refresh_local_btn.clicked.connect(self.check_ollama_status)
-        h1.addWidget(self.use_local_btn, 1); h1.addWidget(self.refresh_local_btn)
-        l2.addLayout(h1)
-        left.addWidget(card2)
+        endpoints_row.addWidget(self.use_local_btn)
+        endpoints_row.addWidget(self.refresh_local_btn)
+        l2.addLayout(endpoints_row)
+        left_scroll_layout.addWidget(card2)
 
         card3, l3 = self._card()
         l3.addWidget(self._sec("DOWNLOAD CORE REMOTE WEIGHTS"))
+        # Download side by side with endpoints area
+        download_row = QHBoxLayout()
         self.pull_model_input = QLineEdit()
-        self.pull_model_input.setPlaceholderText("e.g., llama3, mistral, deepseek-r1:8b")
-        l3.addWidget(self.pull_model_input)
-        self.pull_btn = QPushButton("Pull Model weights")
+        self.pull_model_input.setPlaceholderText("e.g., llama3, mistral...")
+        download_row.addWidget(self.pull_model_input)
+        self.pull_btn = QPushButton("Pull")
+        self.pull_btn.setFixedWidth(50)
         self.pull_btn.clicked.connect(self.start_ollama_pull)
-        l3.addWidget(self.pull_btn)
+        download_row.addWidget(self.pull_btn)
+        l3.addLayout(download_row)
         self.pull_progress = QProgressBar()
-        self.pull_progress.setFixedHeight(12)
+        self.pull_progress.setFixedHeight(10)
         self.pull_progress.hide()
         l3.addWidget(self.pull_progress)
-        left.addWidget(card3)
+        left_scroll_layout.addWidget(card3)
 
-        card4, l4 = self._card()
-        l4.addWidget(self._sec("TERMINAL HOOK"))
-        self.terminal_input = QLineEdit()
-        self.terminal_input.setPlaceholderText("Enter system command...")
-        self.terminal_input.returnPressed.connect(self.run_terminal_command)
-        l4.addWidget(self.terminal_input)
-        left.addWidget(card4)
+        # Image analysis panel (no longer in separate analysis section of menu)
+        left_scroll_layout.addWidget(self._build_image_analysis_panel())
+        left_scroll_layout.addStretch()
 
-        # Image analysis panel
-        left.addWidget(self._build_image_analysis_panel())
-        left.addStretch()
+        left_scroll.setWidget(left_scroll_content)
+        left.addWidget(left_scroll, 4)
+
         body.addLayout(left, 4)
 
         right = QVBoxLayout(); right.setSpacing(6)
@@ -1162,53 +1199,124 @@ class AIAnalysisPage(QWidget):
         body.addLayout(right, 6)
         lay.addLayout(body)
 
-        self.log_output = QTextEdit()
-        self.log_output.setFixedHeight(100)
-        self.log_output.setReadOnly(True)
-        lay.addWidget(self._sec("SYSTEM DIAGNOSTIC LOG REPOSITORY"))
-        lay.addWidget(self.log_output)
+        # Terminal at the bottom (replaces the old system diagnostic log)
+        lay.addWidget(self._build_terminal_panel())
         return w
+
+    def _build_terminal_panel(self):
+        """Build a VS Code-like terminal panel."""
+        frame, lay = self._card()
+        lay.addWidget(self._sec("TERMINAL"))
+        self.terminal_output = QTextEdit()
+        self.terminal_output.setReadOnly(True)
+        self.terminal_output.setFixedHeight(120)
+        self.terminal_output.setStyleSheet(
+            "QTextEdit { background: #0a0a0a; border: 1px solid #252525; color: #00ff00; "
+            "font-family: 'Consolas', 'Courier New', monospace; font-size: 11px; }")
+        self.terminal_output.setPlainText("Pandu Terminal v1.0\nType a command below and press Enter.\n")
+        lay.addWidget(self.terminal_output)
+
+        cmd_row = QHBoxLayout()
+        # Terminal prompt label
+        prompt_lbl = QLabel("$")
+        prompt_lbl.setStyleSheet("color: #00ff00; font-weight: bold; font-size: 12px;")
+        cmd_row.addWidget(prompt_lbl)
+
+        self.terminal_cmd_input = QLineEdit()
+        self.terminal_cmd_input.setPlaceholderText("Enter command...")
+        self.terminal_cmd_input.setStyleSheet(
+            "QLineEdit { background: #0a0a0a; border: 1px solid #252525; color: #00ff00; "
+            "font-family: 'Consolas', 'Courier New', monospace; font-size: 11px; }")
+        self.terminal_cmd_input.returnPressed.connect(self.execute_terminal_command)
+        cmd_row.addWidget(self.terminal_cmd_input, 1)
+
+        self.term_clear_btn = QPushButton("Clear")
+        self.term_clear_btn.setFixedWidth(50)
+        self.term_clear_btn.clicked.connect(lambda: self.terminal_output.setPlainText(""))
+        cmd_row.addWidget(self.term_clear_btn)
+
+        lay.addLayout(cmd_row)
+        self._current_term_worker = None
+        return frame
+
+    def execute_terminal_command(self):
+        cmd = self.terminal_cmd_input.text().strip()
+        if not cmd:
+            return
+        self.terminal_output.append(f"$ {cmd}")
+        self.terminal_cmd_input.clear()
+        if self._current_term_worker and self._current_term_worker.isRunning():
+            self.terminal_output.append("A command is already running. Wait or restart.")
+            return
+        self._current_term_worker = TerminalWorker(cmd)
+        self._current_term_worker.output_ready.connect(lambda txt: self.terminal_output.insertPlainText(txt))
+        self._current_term_worker.finished_signal.connect(self._on_terminal_finished)
+        self._current_term_worker.start()
+
+    def _on_terminal_finished(self):
+        self._current_term_worker = None
 
     def _build_cloud_panel(self):
         w = QWidget(); lay = QVBoxLayout(w); lay.setContentsMargins(0, 0, 0, 0); lay.setSpacing(6)
         body = QHBoxLayout(); body.setSpacing(10)
         left = QVBoxLayout(); left.setSpacing(6)
 
+        # Add scroll area for the left menu (same as local panel)
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        left_scroll_content = QWidget()
+        left_scroll_layout = QVBoxLayout(left_scroll_content)
+        left_scroll_layout.setSpacing(6)
+
+        # Provider and model selection - change models based on provider
         prov_card, prov_lay = self._card()
         prov_lay.addWidget(self._sec("PROVIDER"))
         self.api_provider_combo = QComboBox()
         self.api_provider_combo.addItems(["Gemini", "OpenAI", "Anthropic", "Mistral"])
+        self.api_provider_combo.currentTextChanged.connect(self._update_cloud_models)
         prov_lay.addWidget(self.api_provider_combo)
-        left.addWidget(prov_card)
+        left_scroll_layout.addWidget(prov_card)
 
         api_card, api_lay = self._card()
         api_lay.addWidget(self._sec("MODEL"))
         model_row = QHBoxLayout(); model_row.setSpacing(6)
-        self.gemini_model_combo = QComboBox()
-        self.gemini_model_combo.addItems(["gemini-3.5-flash", "gemini-2.5-flash", "gemini-2.5-pro"])
+        self.cloud_model_combo = QComboBox()
+        self._update_cloud_models("Gemini")
         saved_model = CURRENT_SETTINGS.get("active_gemini_model", "gemini-3.5-flash")
-        idx = self.gemini_model_combo.findText(saved_model)
-        if idx >= 0: self.gemini_model_combo.setCurrentIndex(idx)
-        self.activate_gemini_btn = QPushButton("Use"); self.activate_gemini_btn.setFixedWidth(44)
-        self.activate_gemini_btn.setStyleSheet("QPushButton { background: #081508; border: 1px solid #174517; color: #39ff14; font-size: 11px; border-radius: 4px; }")
-        self.activate_gemini_btn.clicked.connect(self.activate_gemini_model)
-        model_row.addWidget(self.gemini_model_combo, 1); model_row.addWidget(self.activate_gemini_btn)
+        idx = self.cloud_model_combo.findText(saved_model)
+        if idx >= 0: self.cloud_model_combo.setCurrentIndex(idx)
+        self.activate_cloud_btn = QPushButton("Use"); self.activate_cloud_btn.setFixedWidth(44)
+        self.activate_cloud_btn.setStyleSheet("QPushButton { background: #081508; border: 1px solid #174517; color: #39ff14; font-size: 11px; border-radius: 4px; }")
+        self.activate_cloud_btn.clicked.connect(self.activate_cloud_model)
+        model_row.addWidget(self.cloud_model_combo, 1); model_row.addWidget(self.activate_cloud_btn)
         api_lay.addLayout(model_row)
         api_lay.addWidget(self._sec("API KEY"))
         key_row = QHBoxLayout(); key_row.setSpacing(6)
-        self.gemini_api_key_input = QLineEdit()
-        self.gemini_api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.gemini_api_key_input.setPlaceholderText("Google Cloud API key (or set GOOGLE_CLOUD_API_KEY)…")
-        self.gemini_api_key_input.setText(CURRENT_SETTINGS.get("gemini_api_key", ""))
-        self.gemini_api_key_input.editingFinished.connect(self.save_gemini_api_key)
+        self.cloud_api_key_input = QLineEdit()
+        self.cloud_api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.cloud_api_key_input.setPlaceholderText("API key for selected provider...")
+        self.cloud_api_key_input.setText(CURRENT_SETTINGS.get("gemini_api_key", ""))
+        self.cloud_api_key_input.editingFinished.connect(self.save_cloud_api_key)
         save_key_btn = QPushButton("Save"); save_key_btn.setFixedWidth(46)
-        save_key_btn.clicked.connect(self.save_gemini_api_key)
-        key_row.addWidget(self.gemini_api_key_input, 1); key_row.addWidget(save_key_btn)
+        save_key_btn.clicked.connect(self.save_cloud_api_key)
+        key_row.addWidget(self.cloud_api_key_input, 1); key_row.addWidget(save_key_btn)
         api_lay.addLayout(key_row)
-        self.gemini_status_label = QLabel("Initializing status checking...")
-        api_lay.addWidget(self.gemini_status_label)
-        left.addWidget(api_card)
+        self.cloud_status_label = QLabel("Initializing status checking...")
+        api_lay.addWidget(self.cloud_status_label)
+        left_scroll_layout.addWidget(api_card)
+
+        # Image analysis panel for cloud mode
+        left_scroll_layout.addWidget(self._build_image_analysis_panel())
+        left_scroll_layout.addStretch()
+
+        left_scroll.setWidget(left_scroll_content)
+        left.addWidget(left_scroll, 4)
+
+        # Terminal in cloud panel too
+        left.addWidget(self._build_terminal_panel())
         left.addStretch()
+
         body.addLayout(left, 4)
 
         right = QVBoxLayout(); right.setSpacing(6)
@@ -1233,11 +1341,50 @@ class AIAnalysisPage(QWidget):
         right.addLayout(chat_inp_row)
         body.addLayout(right, 6)
         lay.addLayout(body)
+        self.update_cloud_status()
         return w
 
+    def _update_cloud_models(self, provider):
+        """Update the cloud model combo based on selected provider."""
+        self.cloud_model_combo.clear()
+        model_map = {
+            "Gemini": ["gemini-3.5-flash", "gemini-2.5-flash", "gemini-2.5-pro"],
+            "OpenAI": ["gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"],
+            "Anthropic": ["claude-3-opus", "claude-3-sonnet", "claude-3-haiku"],
+            "Mistral": ["mistral-large", "mistral-medium", "mistral-small"]
+        }
+        models = model_map.get(provider, ["gemini-3.5-flash", "gemini-2.5-flash"])
+        self.cloud_model_combo.addItems(models)
+
+    def activate_cloud_model(self):
+        m = self.cloud_model_combo.currentText().strip()
+        provider = self.api_provider_combo.currentText().lower()
+        CURRENT_SETTINGS["active_cloud_provider"] = provider
+        CURRENT_SETTINGS["active_gemini_model"] = m
+        CURRENT_SETTINGS["active_model"] = f"cloud:{provider}:{m}"
+        save_settings(CURRENT_SETTINGS)
+        self.activate_model(f"cloud:{provider}:{m}")
+        self.append_log(f"[Cloud] Architecture target set to: {provider}/{m}")
+
+    def save_cloud_api_key(self):
+        k = self.cloud_api_key_input.text().strip()
+        CURRENT_SETTINGS["gemini_api_key"] = k
+        save_settings(CURRENT_SETTINGS)
+        self.update_cloud_status()
+        self.append_log("[Cloud] Connection credentials saved.")
+
+    def update_cloud_status(self):
+        k = self.cloud_api_key_input.text().strip()
+        if not k:
+            self.cloud_status_label.setText("Status: No API key configured")
+            self.cloud_status_label.setStyleSheet("color: #aa3333;")
+        else:
+            self.cloud_status_label.setText("Status: API key stored ✓")
+            self.cloud_status_label.setStyleSheet("color: #33aa33;")
+
     def append_log(self, text):
-        self.log_output.append(text)
-        self.log_output.moveCursor(QTextCursor.MoveOperation.End)
+        self.terminal_output.append(text)
+        self.terminal_output.moveCursor(QTextCursor.MoveOperation.End)
 
     def check_ollama_status(self):
         base_url = self.ollama_url_input.text().strip()
@@ -1256,16 +1403,7 @@ class AIAnalysisPage(QWidget):
                 self.local_models_combo.clear(); self.local_models_combo.addItem("Offline status error")
         except requests.exceptions.RequestException:
             self.local_models_combo.clear(); self.local_models_combo.addItem("Engine unreachable")
-        self.update_gemini_status()
-
-    def update_gemini_status(self):
-        k = self.get_gemini_api_key()
-        if not k:
-            self.gemini_status_label.setText("Status: Missing Verification Key")
-            self.gemini_status_label.setStyleSheet("color: #aa3333;")
-        else:
-            self.gemini_status_label.setText("Status: Configured Connection Ready")
-            self.gemini_status_label.setStyleSheet("color: #33aa33;")
+        self.update_cloud_status()
 
     def target_local_model(self):
         m = self.local_models_combo.currentText()
@@ -1290,30 +1428,47 @@ class AIAnalysisPage(QWidget):
             self.check_ollama_status()
         else: self.append_log(f"[Ollama Error] Deployment failed: {name}")
 
-    def activate_gemini_model(self):
-        m = self.gemini_model_combo.currentText().strip()
-        CURRENT_SETTINGS["active_gemini_model"] = m
-        CURRENT_SETTINGS["active_model"] = f"gemini:{m}"
-        save_settings(CURRENT_SETTINGS)
-        self.activate_model(f"gemini:{m}")
-        self.append_log(f"[API] Cloud architecture target set to: {m}")
+    def get_gemini_api_key(self):
+        return (self.cloud_api_key_input.text().strip() or
+                CURRENT_SETTINGS.get("gemini_api_key", "") or
+                os.environ.get("GOOGLE_CLOUD_API_KEY", ""))
 
-    def get_gemini_api_key(self): return resolve_gemini_api_key(self.gemini_api_key_input.text())
-    def save_gemini_api_key(self):
-        k = self.get_gemini_api_key()
-        CURRENT_SETTINGS["gemini_api_key"] = k
-        save_settings(CURRENT_SETTINGS)
-        self.update_gemini_status()
-        self.append_log("[API] Connection credentials saved locally.")
+    # ── PAUSE / STOP ANALYSIS ──
+    def pause_analysis(self):
+        if self._analysis_paused:
+            self._analysis_paused = False
+            self.pause_btn.setText("⏸  Pause")
+            self.pause_btn.setStyleSheet(
+                "QPushButton { background: #201808; border: 1px solid #604010; color: #ffaa33; font-weight: bold; padding: 6px; }"
+                "QPushButton:hover { background: #302010; }"
+                "QPushButton:disabled { color: #222; border-color: #111; background: #080808; }")
+            self.analysis_paused_state.emit(False)
+        else:
+            self._analysis_paused = True
+            self.pause_btn.setText("▶  Resume")
+            self.pause_btn.setStyleSheet(
+                "QPushButton { background: #082010; border: 1px solid #106020; color: #33ff66; font-weight: bold; padding: 6px; }"
+                "QPushButton:hover { background: #103020; }"
+                "QPushButton:disabled { color: #222; border-color: #111; background: #080808; }")
+            self.analysis_paused_state.emit(True)
 
-    def run_terminal_command(self):
-        cmd = self.terminal_input.text().strip()
-        if not cmd: return
-        self.terminal_input.clear()
-        self.append_log(f"$ {cmd}\n")
-        self.term_worker = TerminalWorker(cmd)
-        self.term_worker.output_ready.connect(self.append_log)
-        self.term_worker.start()
+    def stop_analysis(self):
+        self._analysis_stopped = True
+        if self._image_analysis_worker and self._image_analysis_worker.isRunning():
+            self._image_analysis_worker.terminate()
+            self._image_analysis_worker = None
+        self.analyse_btn.setEnabled(True)
+        self.pause_btn.setEnabled(False)
+        self.stop_btn.setEnabled(False)
+        self.pause_btn.setText("⏸  Pause")
+        self._analysis_paused = False
+        self._analysis_stopped = False
+        self._analysis_total_chunks = 0
+        self._analysis_chunks_received = 0
+        self._analysis_saved_count = 0
+        self.progress_updated.emit(0)
+        self.analysis_stopped_state.emit(True)
+        self.append_log("[Analysis] Stopped by user.")
 
     # ── IMAGE ANALYSIS ──
     def run_image_analysis(self):
@@ -1328,6 +1483,10 @@ class AIAnalysisPage(QWidget):
         if self._image_analysis_worker is not None and self._image_analysis_worker.isRunning():
             return
 
+        self._analysis_paused = False
+        self._analysis_stopped = False
+        self._analysis_result_buffer = ""
+
         # Check access and collect security concerns
         concerns = []
         needs_permission = False
@@ -1337,14 +1496,17 @@ class AIAnalysisPage(QWidget):
 
         is_cloud = self._ai_mode == "cloud"
         if is_cloud:
-            concerns.append("• The image will be uploaded and sent to Google's Gemini API servers.")
+            concerns.append("• The image will be uploaded and sent to a third-party API server.")
             concerns.append("• This means image data leaves your local machine temporarily.")
             concerns.append("• Ensure you have rights to share this image with a third-party service.")
+            concerns.append("• The selected cloud provider may log or retain your data per their privacy policy.")
+            concerns.append("• Do NOT upload sensitive, personal, or confidential images.")
 
         if needs_permission:
             concerns.append("• Your system password will be used via sudo to grant temporary read access.")
             concerns.append("• This access automatically expires after 5 minutes.")
             concerns.append("• If the application crashes, file permissions may not be restored automatically.")
+            concerns.append("• Temporary file access is granted to the current user only.")
 
         if concerns:
             warning_text = "\n".join(concerns)
@@ -1368,17 +1530,18 @@ class AIAnalysisPage(QWidget):
             self.access_status_lbl.setText("Access: Temporary access granted ✓")
             self.access_status_lbl.setStyleSheet("color: #33aa33; font-size: 10px;")
 
-        self.analysis_output.clear()
         self.analyse_btn.setEnabled(False)
-        self.analysis_output.setPlainText("Analysing...")
+        self.pause_btn.setEnabled(True)
+        self.stop_btn.setEnabled(True)
 
         if is_cloud:
             api_key = self.get_gemini_api_key()
             if not api_key:
-                self.analysis_output.setPlainText("[Error: No API key configured.]")
                 self.analyse_btn.setEnabled(True)
+                self.pause_btn.setEnabled(False)
+                self.stop_btn.setEnabled(False)
                 return
-            model_name = self.gemini_model_combo.currentText().strip()
+            model_name = self.cloud_model_combo.currentText().strip()
             self._image_analysis_worker = GeminiImageAnalysisWorker(model_name, prompt, api_key, [img_path])
             self._image_analysis_worker.output_ready.connect(self._append_analysis_chunk)
             self._image_analysis_worker.finished_signal.connect(self._finished_image_analysis)
@@ -1386,8 +1549,9 @@ class AIAnalysisPage(QWidget):
         else:
             active_model = CURRENT_SETTINGS.get("active_model", "")
             if not active_model or active_model.startswith("gemini:"):
-                self.analysis_output.setPlainText("[Error: No local model targeted.]")
                 self.analyse_btn.setEnabled(True)
+                self.pause_btn.setEnabled(False)
+                self.stop_btn.setEnabled(False)
                 return
             base_url = self.ollama_url_input.text().strip()
             self._image_analysis_worker = LocalImageAnalysisWorker(base_url, active_model, prompt, [img_path])
@@ -1398,26 +1562,50 @@ class AIAnalysisPage(QWidget):
         self.append_log(f"[Analysis] Started analysis of: {os.path.basename(img_path)}")
 
     def _append_analysis_chunk(self, chunk):
-        current = self.analysis_output.toPlainText()
-        if current == "Analysing...":
-            self.analysis_output.clear()
-        self.analysis_output.moveCursor(QTextCursor.MoveOperation.End)
-        self.analysis_output.insertPlainText(chunk)
-        self.analysis_output.moveCursor(QTextCursor.MoveOperation.End)
+        if self._analysis_stopped:
+            return
+        if self._analysis_paused:
+            # Buffer chunks while paused
+            self._analysis_result_buffer += chunk
+            return
+        self._analysis_chunks_received += 1
+        pct = min(95, int((self._analysis_chunks_received / (self._analysis_chunks_received + 5)) * 100))
+        self.progress_updated.emit(pct)
+        # Gradually save to AI database as data comes in
+        if self._analysis_chunks_received % 5 == 0:
+            self._analysis_saved_count += 1
+            partial_data = self._analysis_result_buffer + chunk if self._analysis_result_buffer else chunk
+            img_path = self.img_selector_combo.currentData() or ""
+            try:
+                run_ai_query(
+                    "INSERT INTO ai_analysis_db (artifact_name, model_used, confidence_score, transcription, translation, notes) VALUES (?, ?, ?, ?, ?, ?)",
+                    (f"{os.path.basename(img_path)} (partial)", CURRENT_SETTINGS.get("active_model", ""), "N/A", partial_data[:200], "N/A", f"Partial save #{self._analysis_saved_count}"))
+            except Exception:
+                pass
 
     def _finished_image_analysis(self, success, err):
         self.analyse_btn.setEnabled(True)
+        self.pause_btn.setEnabled(False)
+        self.stop_btn.setEnabled(False)
+        self.pause_btn.setText("⏸  Pause")
+        self._analysis_paused = False
+        worker = self._image_analysis_worker
         self._image_analysis_worker = None
-        if success:
-            result = self.analysis_output.toPlainText()
+        if success and not self._analysis_stopped:
+            result = self._analysis_result_buffer or "Analysis completed"
             img_path = self.img_selector_combo.currentData() or ""
             run_ai_query(
                 "INSERT INTO ai_analysis_db (artifact_name, model_used, confidence_score, transcription, translation, notes) VALUES (?, ?, ?, ?, ?, ?)",
                 (os.path.basename(img_path), CURRENT_SETTINGS.get("active_model", ""), "N/A", result, "N/A", "Image Analysis"))
+            self.progress_updated.emit(100)
+            self.analysis_completed.emit(True)
             self.append_log("[Analysis] Completed and saved to AI database.")
-        else:
-            self.analysis_output.setPlainText(f"[Error: {err}]")
+        elif not self._analysis_stopped:
             self.append_log(f"[Analysis Error] {err}")
+            self.progress_updated.emit(0)
+        self._analysis_total_chunks = 0
+        self._analysis_chunks_received = 0
+        self._analysis_saved_count = 0
 
     # ── CLOUD CHAT HANDLERS ──
     def submit_embedded_cloud_chat(self):
@@ -1431,12 +1619,12 @@ class AIAnalysisPage(QWidget):
         self._current_cloud_ai_bubble = ChatBubble("", is_user=False)
         self.cloud_chat_layout.addWidget(self._current_cloud_ai_bubble)
         history_text = "\n".join(self.gemini_chat_history)
-        full_prompt = (f"{history_text}\nUser: {text}\nGemini:" if history_text else text)
+        full_prompt = (f"{history_text}\nUser: {text}\nAI:" if history_text else text)
         self.gemini_chat_history.append(f"User: {text}")
-        model_name = self.gemini_model_combo.currentText().strip()
+        model_name = self.cloud_model_combo.currentText().strip()
         api_key = self.get_gemini_api_key()
         if not api_key:
-            self._current_cloud_ai_bubble.append_text("[Error: No API key configured. Save your Gemini API key first.]")
+            self._current_cloud_ai_bubble.append_text("[Error: No API key configured. Save your API key first.]")
             return
         self.cloud_msg_input.setEnabled(False); self.cloud_send_btn.setEnabled(False)
         self._gemini_parts = []
@@ -1460,12 +1648,12 @@ class AIAnalysisPage(QWidget):
         self._gemini_worker = None
         if success:
             full_response = "".join(self._gemini_parts)
-            self.gemini_chat_history.append(f"Gemini: {full_response}")
+            self.gemini_chat_history.append(f"AI: {full_response}")
             run_ai_query(
                 "INSERT INTO ai_analysis_db (artifact_name, model_used, confidence_score, transcription, translation, notes) VALUES (?, ?, ?, ?, ?, ?)",
                 ("Cloud Conversation Fragment", CURRENT_SETTINGS.get("active_model", ""), "N/A", "N/A", "N/A", full_response))
         else:
-            self.append_log(f"[API Error] Stream execution aborted: {engine_msg}")
+            self.append_log(f"[Cloud Chat Error] {engine_msg}")
             if self._current_cloud_ai_bubble is not None:
                 self._current_cloud_ai_bubble.append_text(f"\n[Error: {engine_msg}]")
 
@@ -1525,15 +1713,21 @@ class AIDatabasePage(QWidget):
         super().__init__()
         layout = QVBoxLayout(self)
         top = QHBoxLayout()
-        ref = QPushButton("⟳ Refresh Registry Logs"); ref.clicked.connect(self.load_data)
-        clear_all = QPushButton("🗑️ Purge Archive Logs")
+        ref = QPushButton("⟳ Refresh"); ref.clicked.connect(self.load_data)
+        chg_ai = QPushButton("📂 Change AI Dir")
+        chg_ai.clicked.connect(lambda: self.migrate(QFileDialog.getExistingDirectory(self, "Select Folder")))
+        df_ai = QPushButton("🔄 Reset AI Default")
+        df_ai.clicked.connect(lambda: self.migrate(DEFAULT_AI_DB_DIR))
+        clear_all = QPushButton("🗑️ Purge All Records")
         clear_all.setStyleSheet("QPushButton { background: #250505; color: #ff6666; border-color: #4a1515; }")
         clear_all.clicked.connect(self.purge_all_records)
-        top.addWidget(ref); top.addWidget(clear_all); top.addStretch()
+        top.addWidget(ref); top.addWidget(chg_ai); top.addWidget(df_ai)
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.VLine); sep.setFrameShadow(QFrame.Shadow.Sunken)
+        top.addWidget(sep); top.addWidget(clear_all); top.addStretch()
         layout.addLayout(top)
         self.table = QTableWidget()
-        self.table.setColumnCount(7)
-        self.table.setHorizontalHeaderLabels(["Log ID", "Artifact target", "Model Trace Entity", "Confidence Metrics", "Transcription Output", "Translation Record", "Notes Overview"])
+        self.table.setColumnCount(8)
+        self.table.setHorizontalHeaderLabels(["ID", "Artifact Name", "Model Used", "Confidence Score", "Transcription", "Translation", "Notes", "Actions"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         layout.addWidget(self.table)
@@ -1544,11 +1738,84 @@ class AIDatabasePage(QWidget):
             r_idx = self.table.rowCount(); self.table.insertRow(r_idx)
             for i in range(7):
                 self.table.setItem(r_idx, i, QTableWidgetItem(str(row[i]) if row[i] is not None else ""))
+            # Edit and Delete buttons
+            act = QWidget(); a_lay = QHBoxLayout(act); a_lay.setContentsMargins(2, 2, 2, 2)
+            e_btn = QPushButton("Edit")
+            d_btn = QPushButton("Delete")
+            e_btn.clicked.connect(lambda checked, r=row: self.edit_row(r))
+            d_btn.clicked.connect(lambda checked, i=row[0]: self.delete_row(i))
+            a_lay.addWidget(e_btn); a_lay.addWidget(d_btn)
+            self.table.setCellWidget(r_idx, 7, act)
+    def edit_row(self, row):
+        d = EditAIDialog(row, self)
+        if d.exec() == QDialog.DialogCode.Accepted:
+            data = d.get_data()
+            run_ai_query(
+                "UPDATE ai_analysis_db SET artifact_name=?,model_used=?,confidence_score=?,transcription=?,translation=?,notes=? WHERE id=?",
+                data)
+            self.load_data()
+    def delete_row(self, r_id):
+        if QMessageBox.question(self, 'Delete', 'Delete this record?', QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
+            run_ai_query("DELETE FROM ai_analysis_db WHERE id = ?", (r_id,))
+            self.load_data()
+    def migrate(self, path):
+        current_dir = AIDatabaseManager.get_dir()
+        if not path or path == current_dir: return
+        c = MigrationChoiceDialog(self)
+        if c.exec() != QDialog.DialogCode.Accepted: return
+        self.pd = FileTransferProgressDialog(self)
+        self.worker = MigrationWorker(current_dir, path, c.choice)
+        self.worker.progress_updated.connect(self.pd.progress_bar.setValue)
+        self.worker.status_updated.connect(self.pd.status_label.setText)
+        self.worker.migration_finished.connect(lambda s, m: self.mig_done(s, m, path))
+        self.worker.start(); self.pd.exec()
+    def mig_done(self, success, msg, path):
+        self.pd.accept()
+        if success:
+            AIDatabaseManager.set_dir(path)
+            CURRENT_SETTINGS["ai_db_directory"] = path
+            save_settings(CURRENT_SETTINGS)
+            self.load_data()
+            QMessageBox.information(self, "Success", "AI database relocated successfully.")
+        else: QMessageBox.critical(self, "Error", f"Failed: {msg}")
     def purge_all_records(self):
-        if QMessageBox.question(self, 'Purge Log Data', 'Delete all historical AI processing logs from this system permanently?',
+        if QMessageBox.question(self, 'Purge Data', 'Delete all AI analysis records permanently?',
                                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
             run_ai_query("DELETE FROM ai_analysis_db")
             self.load_data()
+
+class EditAIDialog(QDialog):
+    def __init__(self, row_data, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit AI Analysis Record")
+        self.entry_id = row_data[0]
+        layout = QVBoxLayout(self)
+        labels = ["Artifact Name", "Model Used", "Confidence Score", "Transcription", "Translation", "Notes"]
+        self.inputs = {}
+        for i, label in enumerate(labels):
+            val = row_data[i + 1] if i + 1 < len(row_data) else ""
+            inp = QTextEdit(val)
+            inp.setFixedHeight(60)
+            self.inputs[label] = inp
+            layout.addWidget(QLabel(label))
+            layout.addWidget(inp)
+        btn_row = QHBoxLayout()
+        save_btn = QPushButton("Save Changes")
+        cancel_btn = QPushButton("Cancel")
+        save_btn.clicked.connect(self.accept)
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addStretch(); btn_row.addWidget(cancel_btn); btn_row.addWidget(save_btn)
+        layout.addLayout(btn_row)
+    def get_data(self):
+        return (
+            self.inputs["Artifact Name"].toPlainText(),
+            self.inputs["Model Used"].toPlainText(),
+            self.inputs["Confidence Score"].toPlainText(),
+            self.inputs["Transcription"].toPlainText(),
+            self.inputs["Translation"].toPlainText(),
+            self.inputs["Notes"].toPlainText(),
+            self.entry_id
+        )
 
 # ── Main Application Framework Window ─────────────────────────────────────────
 
@@ -1562,8 +1829,11 @@ class MainWindow(QMainWindow):
             self.setWindowIcon(app_icon)
             QApplication.instance().setWindowIcon(app_icon)
         self.setStyleSheet("QMainWindow { background: #070707; }")
+
         w = QWidget(); self.setCentralWidget(w)
         layout = QVBoxLayout(w); layout.setContentsMargins(10, 10, 10, 10); layout.setSpacing(10)
+
+        # Header
         header = QHBoxLayout(); header.setSpacing(10)
         self.logo_lbl = QLabel()
         self.logo_lbl.setFixedSize(48, 48)
@@ -1577,19 +1847,30 @@ class MainWindow(QMainWindow):
         sub_lbl = QLabel("INTELLIGENT COMPUTATIONAL ARCHAEOLOGICAL WORKSPACE"); sub_lbl.setStyleSheet("color: #444444; font-size: 9px; font-weight: bold; letter-spacing: 1px;")
         title_col.addWidget(t_lbl); title_col.addWidget(sub_lbl)
         header.addLayout(title_col); header.addStretch(); layout.addLayout(header)
-        body = QHBoxLayout(); body.setSpacing(15)
-        nav = QVBoxLayout(); nav.setSpacing(4); nav.setAlignment(Qt.AlignmentFlag.AlignTop)
-        items = ["Data Entry", "Library", "AI Analysis", "AI Database", "Analytics", "Project Planner", "Export engine", "Configuration"]
+
+        # Horizontal toolbar at top
+        self.toolbar_frame = QFrame()
+        self.toolbar_frame.setStyleSheet("QFrame { background: #0a0a0a; border: 1px solid #1a1a1a; border-radius: 4px; padding: 2px; }")
+        toolbar_layout = QHBoxLayout(self.toolbar_frame)
+        toolbar_layout.setContentsMargins(6, 3, 6, 3)
+        toolbar_layout.setSpacing(4)
+        items = ["Data Entry", "Library", "AI Analysis", "AI Database", "Analytics", "Train", "Script Analysis"]
         self.btns = {}
         for item in items:
             btn = QPushButton(item)
-            btn.setFixedSize(140, 28)
+            btn.setFixedSize(110, 28)
             btn.setCheckable(True)
-            btn.setStyleSheet("QPushButton { text-align: left; padding-left: 10px; background: #0d0d0d; border: 1px solid #141414; color: #777; font-size: 11px; } QPushButton:hover { background: #121212; color: #bbb; } QPushButton:checked { background: #161616; border-color: #bb4400; color: #bb4400; font-weight: bold; }")
+            btn.setStyleSheet("""
+                QPushButton { text-align: center; background: #0d0d0d; border: 1px solid #141414; color: #777; font-size: 11px; border-radius: 3px; }
+                QPushButton:hover { background: #121212; color: #bbb; }
+                QPushButton:checked { background: #161616; border-color: #bb4400; color: #bb4400; font-weight: bold; }
+            """)
             btn.clicked.connect(lambda checked, name=item: self.navigate(name))
-            nav.addWidget(btn); self.btns[item] = btn
+            toolbar_layout.addWidget(btn); self.btns[item] = btn
         self.btns["Data Entry"].setChecked(True)
-        body.addLayout(nav)
+        layout.addWidget(self.toolbar_frame)
+
+        # Stacked pages
         self.stack = QStackedWidget()
         self.data_page = DataPage()
         self.library_page = LibraryPage()
@@ -1597,16 +1878,85 @@ class MainWindow(QMainWindow):
         self.ai_database_page = AIDatabasePage()
         self.data_page.goToLibrary.connect(self.saved_to_library)
         pages = [self.data_page, self.library_page, self.ai_analysis_page, self.ai_database_page]
-        pages += [PlaceholderPage(i) for i in items[4:]]
-        self.pages = {name: idx for idx, name in enumerate(items)}
-        for page in pages: self.stack.addWidget(page)
-        body.addWidget(self.stack, 1)
-        layout.addLayout(body)
-        self.status_footer = QLabel(f"Project Library DB: {DatabaseManager.get_dir()} | AI Log Trace Repository: {AIDatabaseManager.get_dir()}")
+        placeholder_names = ["Analytics", "Train", "Script Analysis"]
+        for pn in placeholder_names:
+            pages.append(PlaceholderPage(pn))
+        self.pages = {}
+        for idx, name in enumerate(items):
+            self.pages[name] = idx
+        for page in pages:
+            self.stack.addWidget(page)
+        layout.addWidget(self.stack, 1)
+
+        # Progress bar at the very bottom
+        progress_row = QHBoxLayout()
+        self.analysis_progress_bar = QProgressBar()
+        self.analysis_progress_bar.setFixedHeight(16)
+        self.analysis_progress_bar.setValue(0)
+        self.analysis_progress_bar.setStyleSheet("""
+            QProgressBar { background: #0a0a0a; border: 1px solid #1a1a1a; border-radius: 3px; text-align: center; color: #aaaaaa; font-size: 9px; }
+            QProgressBar::chunk { background: #2255aa; border-radius: 2px; }
+        """)
+        self.analysis_complete_label = QLabel("")
+        self.analysis_complete_label.setFixedWidth(20)
+        self.analysis_complete_label.setStyleSheet("color: #33ff33; font-size: 14px; font-weight: bold;")
+        progress_row.addWidget(self.analysis_progress_bar, 1)
+        progress_row.addWidget(self.analysis_complete_label)
+        layout.addLayout(progress_row)
+
+        self.status_footer = QLabel(f"Project Library DB: {DatabaseManager.get_dir()} | AI Database: {AIDatabaseManager.get_dir()}")
         self.status_footer.setStyleSheet("color: #333; font-size: 10px; padding-top: 4px;")
         layout.addWidget(self.status_footer)
 
+        # Connect AI analysis page signals to progress bar
+        self.ai_analysis_page.progress_updated.connect(self._update_analysis_progress)
+        self.ai_analysis_page.analysis_completed.connect(self._on_analysis_completed)
+        self.ai_analysis_page.analysis_paused_state.connect(self._on_analysis_paused)
+        self.ai_analysis_page.analysis_stopped_state.connect(self._on_analysis_stopped)
+
+    def _update_analysis_progress(self, value):
+        self.analysis_progress_bar.setValue(value)
+        if value == 100:
+            self.analysis_progress_bar.setStyleSheet("""
+                QProgressBar { background: #0a0a0a; border: 1px solid #1a1a1a; border-radius: 3px; text-align: center; color: #aaaaaa; font-size: 9px; }
+                QProgressBar::chunk { background: #22aa55; border-radius: 2px; }
+            """)
+            self.analysis_complete_label.setText("✓")
+        elif value > 0:
+            self.analysis_complete_label.setText("")
+
+    def _on_analysis_completed(self, completed):
+        if completed:
+            self.analysis_progress_bar.setValue(100)
+            self.analysis_progress_bar.setStyleSheet("""
+                QProgressBar { background: #0a0a0a; border: 1px solid #1a1a1a; border-radius: 3px; text-align: center; color: #aaaaaa; font-size: 9px; }
+                QProgressBar::chunk { background: #22aa55; border-radius: 2px; }
+            """)
+            self.analysis_complete_label.setText("✓")
+
+    def _on_analysis_paused(self, paused):
+        if paused:
+            self.analysis_progress_bar.setStyleSheet("""
+                QProgressBar { background: #0a0a0a; border: 1px solid #1a1a1a; border-radius: 3px; text-align: center; color: #aaaaaa; font-size: 9px; }
+                QProgressBar::chunk { background: #aaaa22; border-radius: 2px; }
+            """)
+        else:
+            self.analysis_progress_bar.setStyleSheet("""
+                QProgressBar { background: #0a0a0a; border: 1px solid #1a1a1a; border-radius: 3px; text-align: center; color: #aaaaaa; font-size: 9px; }
+                QProgressBar::chunk { background: #2255aa; border-radius: 2px; }
+            """)
+
+    def _on_analysis_stopped(self, stopped):
+        if stopped:
+            self.analysis_progress_bar.setValue(0)
+            self.analysis_progress_bar.setStyleSheet("""
+                QProgressBar { background: #0a0a0a; border: 1px solid #1a1a1a; border-radius: 3px; text-align: center; color: #aaaaaa; font-size: 9px; }
+                QProgressBar::chunk { background: #2255aa; border-radius: 2px; }
+            """)
+            self.analysis_complete_label.setText("")
+
     def closeEvent(self, event):
+        # Check for any leftover temporary permissions and revoke them on startup recovery
         PermissionManager.revoke_all()
         super().closeEvent(event)
 
@@ -1624,12 +1974,15 @@ class MainWindow(QMainWindow):
             elif name == "AI Analysis":
                 self.ai_analysis_page.update_banner_style()
                 self.ai_analysis_page.refresh_library_images()
-            self.status_footer.setText(f"Project Library DB: {DatabaseManager.get_dir()} | AI Log Trace Repository: {AIDatabaseManager.get_dir()}")
+            self.status_footer.setText(
+                f"Project Library DB: {DatabaseManager.get_dir()} | AI Database: {AIDatabaseManager.get_dir()}")
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
     if os.path.exists(LOGO_PATH):
         app.setWindowIcon(QIcon(LOGO_PATH))
+    # On startup, check for any leftover temporary permissions and revoke
+    PermissionManager.revoke_all()
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
