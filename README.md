@@ -4,37 +4,37 @@ Pandu is a desktop application for computational archaeology, designed to help r
 
 ## Features
 
-### 📚 Artifact Database
+### Artifact Database
 - **Data Entry**: Add artifacts with metadata (name, writing system, time period, region, source) and associated images via drag-and-drop or file browser
 - **Library**: Browse, edit, search, and manage all cataloged artifacts in a table view
 - **Database Relocation**: Move or copy your database to custom directories
 
-### 🤖 AI-Powered Analysis
+### AI-Powered Analysis
 - **Dual AI Mode**: Switch between local (Ollama) and cloud (Gemini, OpenAI, Anthropic, Mistral) AI models
 - **Image Analysis**: Select artifacts from your library and run AI-powered analysis with custom prompts
 - **Script Analysis**: Drag-and-drop script images for automatic transcription, translation, and attribute detection
 - **Cloud Chat**: Interactive chat interface with cloud AI providers
 - **Local Chat**: Chat with locally-hosted models via Ollama
 
-### 📊 Training & Pattern Recognition
+### Training & Pattern Recognition
 - **Script Training**: Train AI models on your artifact data to recognize writing systems, letterforms, and transformation patterns
 - **Trained Models**: Save, activate, and manage trained script models
 - **Statistical Charts**: Visual confidence match percentages for writing system, glyph, period, region, and material
 
-### 📄 PDF Report Generation
+### PDF Report Generation
 Generate comprehensive PDF reports containing:
 - Full script translation
 - Probable attributes (name, writing system, time period, region, source)
 - Statistical match percentages with bar chart visualization
 - AI reasoning and decision explanation
 
-### 🔒 Security
+### Security
 - **API keys are stored in memory only** — never written to disk
 - On application restart, you must re-enter your API key
 - Temporary file permission management with automatic revocation
 - Security warnings before sending data to third-party APIs
 
-### 🖥️ Additional Tools
+### Additional Tools
 - Built-in terminal for shell commands
 - Permission manager for accessing protected files
 - Snap-to-screen-edge window management
