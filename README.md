@@ -1,4 +1,4 @@
-# Pandu — Intelligent Computational Archaeological Workspace
+# Pandu - Intelligent Computational Archaeological Workspace
 
 Pandu is a desktop application for computational archaeology, designed to help researchers, epigraphists, and historians catalog, analyze, and translate ancient scripts and artifacts using both local and cloud-based AI models.
 
@@ -29,7 +29,7 @@ Generate comprehensive PDF reports containing:
 - AI reasoning and decision explanation
 
 ### Security
-- **API keys are stored in memory only** — never written to disk
+- **API keys are stored in memory only** - never written to disk
 - On application restart, you must re-enter your API key
 - Temporary file permission management with automatic revocation
 - Security warnings before sending data to third-party APIs
