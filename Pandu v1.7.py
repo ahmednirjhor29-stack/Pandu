@@ -23,15 +23,15 @@ from PyQt6.QtWidgets import (
     QPushButton, QLineEdit, QComboBox, QHBoxLayout, QMessageBox,
     QProgressBar, QScrollArea, QInputDialog, QStackedWidget, QTableWidget,
     QTableWidgetItem, QHeaderView, QDialog, QTextEdit, QFrame, QSizePolicy,
-    QTabWidget, QGridLayout, QGroupBox, QSplitter
+    QTabWidget, QGridLayout, QGroupBox, QSplitter, QToolButton
 )
-from PyQt6.QtGui import QIcon, QPixmap, QColor, QFont, QTextCursor, QPainter, QBrush, QPen, QFontMetrics, QLinearGradient
+from PyQt6.QtGui import QIcon, QPixmap, QColor, QFont, QTextCursor, QPainter, QBrush, QPen, QFontMetrics, QLinearGradient, QCursor
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer, QRect, QSize, QPoint
 
 SETTINGS_FILE = os.path.join(os.path.expanduser("~"), ".pandu_settings.json")
 DEFAULT_DB_DIR = os.path.join(os.path.expanduser("~"), ".pandu_database")
 DEFAULT_AI_DB_DIR = os.path.join(os.path.expanduser("~"), ".pandu_ai_database")
-LOGO_PATH = "/media/rinniro/gamessd/ScriptLense/assets/logo.png"
+LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "logo.png")
 TEMP_ACCESS_DURATION = 300  # 5 minutes in seconds
 
 DEFAULT_SETTINGS = {
@@ -39,9 +39,8 @@ DEFAULT_SETTINGS = {
     "sources": ["Stone Tablet", "Clay Tablet", "Copper Plate", "Wall", "Paper"],
     "db_directory": DEFAULT_DB_DIR,
     "active_model": "",
-    "gemini_api_key": "",
     "ai_mode": "local",
-    "active_gemini_model": "gemini-2.5-flash"
+    "active_gemini_model": "gemini-3.5-flash"
 }
 
 def load_settings():
@@ -711,24 +710,34 @@ class DataPage(QWidget):
         self.era = QComboBox(); self.era.addItems(["BCE", "CE"])
         self.region = QLineEdit()
         self.src = QComboBox(); self.src.addItems(self.settings["sources"])
-        form_lay.addWidget(QLabel("Name:")); form_lay.addWidget(self.name)
+        name_lbl = QLabel("Name:")
+        name_lbl.setStyleSheet("color: #888888; font-size: 12px; font-weight: normal; background: transparent; border: none;")
+        form_lay.addWidget(name_lbl); form_lay.addWidget(self.name)
         ws_row = QHBoxLayout(); ws_row.addWidget(self.ws)
         add_ws = QPushButton("+")
         add_ws.setFixedWidth(30)
         add_ws.clicked.connect(lambda: self.add_setting("writing_systems", self.ws))
         ws_row.addWidget(add_ws)
-        form_lay.addWidget(QLabel("Writing System:")); form_lay.addLayout(ws_row)
+        ws_lbl = QLabel("Writing System:")
+        ws_lbl.setStyleSheet("color: #888888; font-size: 12px; font-weight: normal; background: transparent; border: none;")
+        form_lay.addWidget(ws_lbl); form_lay.addLayout(ws_row)
         t_row = QHBoxLayout()
         t_row.addWidget(self.start_yr); t_row.addWidget(self.end_yr)
         t_row.addWidget(self.era)
-        form_lay.addWidget(QLabel("Time Period:")); form_lay.addLayout(t_row)
-        form_lay.addWidget(QLabel("Region:")); form_lay.addWidget(self.region)
+        tp_lbl = QLabel("Time Period:")
+        tp_lbl.setStyleSheet("color: #888888; font-size: 12px; font-weight: normal; background: transparent; border: none;")
+        form_lay.addWidget(tp_lbl); form_lay.addLayout(t_row)
+        region_lbl = QLabel("Region:")
+        region_lbl.setStyleSheet("color: #888888; font-size: 12px; font-weight: normal; background: transparent; border: none;")
+        form_lay.addWidget(region_lbl); form_lay.addWidget(self.region)
         src_row = QHBoxLayout(); src_row.addWidget(self.src)
         add_src = QPushButton("+")
         add_src.setFixedWidth(30)
         add_src.clicked.connect(lambda: self.add_setting("sources", self.src))
         src_row.addWidget(add_src)
-        form_lay.addWidget(QLabel("Source:")); form_lay.addLayout(src_row)
+        src_lbl = QLabel("Source:")
+        src_lbl.setStyleSheet("color: #888888; font-size: 12px; font-weight: normal; background: transparent; border: none;")
+        form_lay.addWidget(src_lbl); form_lay.addLayout(src_row)
         layout.addWidget(form_frame)
         self.save_btn = QPushButton("Save to Database ✓")
         self.save_btn.setEnabled(False)
@@ -865,6 +874,7 @@ class ChatBubble(QFrame):
         super().__init__(parent)
         self._text = text
         self.is_user = is_user
+        self.setStyleSheet("ChatBubble { border: none; background: transparent; }")
         outer = QHBoxLayout(self); outer.setContentsMargins(4, 2, 4, 2); outer.setSpacing(0)
         col = QVBoxLayout(); col.setSpacing(2)
         box = QFrame()
@@ -881,15 +891,22 @@ class ChatBubble(QFrame):
             self._lbl.setStyleSheet("color: #7fffee; font-size: 12px; font-family: 'Consolas', monospace; background: transparent; border: none;")
         box_lay.addWidget(self._lbl); col.addWidget(box)
         copy_row = QHBoxLayout()
-        copy_btn = QPushButton("⎘ copy"); copy_btn.setFixedHeight(14)
-        copy_btn.setStyleSheet("QPushButton { background: transparent; border: none; color: #2e2e2e; font-size: 9px; padding: 0 2px; } QPushButton:hover { color: #888888; }")
-        copy_btn.clicked.connect(self._copy)
-        if is_user: copy_row.addStretch(); copy_row.addWidget(copy_btn)
-        else: copy_row.addWidget(copy_btn); copy_row.addStretch()
+        self._copy_btn = QPushButton("⎘ copy"); self._copy_btn.setFixedHeight(14)
+        self._copy_btn.setStyleSheet("QPushButton { background: transparent; border: none; color: #2e2e2e; font-size: 9px; padding: 0 2px; } QPushButton:hover { color: #888888; }")
+        self._copy_btn.clicked.connect(self._copy)
+        if is_user: copy_row.addStretch(); copy_row.addWidget(self._copy_btn)
+        else: copy_row.addWidget(self._copy_btn); copy_row.addStretch()
         col.addLayout(copy_row)
         if is_user: outer.addStretch(); outer.addLayout(col)
         else: outer.addLayout(col); outer.addStretch()
-    def _copy(self): QApplication.clipboard().setText(self._text)
+    def _copy(self):
+        QApplication.clipboard().setText(self._text)
+        self._copy_btn.setText("✓ copied")
+        self._copy_btn.setStyleSheet("QPushButton { background: transparent; border: none; color: #44cc44; font-size: 9px; padding: 0 2px; }")
+        QTimer.singleShot(2000, self._reset_copy_btn)
+    def _reset_copy_btn(self):
+        self._copy_btn.setText("⎘ copy")
+        self._copy_btn.setStyleSheet("QPushButton { background: transparent; border: none; color: #2e2e2e; font-size: 9px; padding: 0 2px; } QPushButton:hover { color: #888888; }")
     def append_text(self, chunk: str):
         self._text += chunk
         self._lbl.setText(self._text)
@@ -924,9 +941,9 @@ class AIAnalysisPage(QWidget):
         self.status_timer.start(4000)
         self.check_ollama_status()
 
-    def _sec(self, text):
+    def _sec(self, text, border=""):
         l = QLabel(text)
-        l.setStyleSheet("color: #383838; font-size: 9px; font-weight: bold; letter-spacing: 2px; margin-top: 6px;")
+        l.setStyleSheet(f"color: #383838; font-size: 9px; font-weight: bold; letter-spacing: 2px; margin-top: 6px; background: transparent; border: none;")
         return l
 
     def _card(self):
@@ -1141,7 +1158,18 @@ class AIAnalysisPage(QWidget):
 
     def _build_local_panel(self):
         w = QWidget(); lay = QVBoxLayout(w); lay.setContentsMargins(0, 0, 0, 0); lay.setSpacing(6)
-        body = QHBoxLayout(); body.setSpacing(10)
+
+        # Wrap the entire body in a horizontal scroll area
+        body_scroll = QScrollArea()
+        body_scroll.setWidgetResizable(True)
+        body_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        body_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        body_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        body_scroll_content = QWidget()
+        body_scroll_layout = QHBoxLayout(body_scroll_content)
+        body_scroll_layout.setContentsMargins(0, 0, 0, 0)
+        body_scroll_layout.setSpacing(10)
+
         left = QVBoxLayout(); left.setSpacing(6)
 
         left_scroll = QScrollArea()
@@ -1197,7 +1225,7 @@ class AIAnalysisPage(QWidget):
         left_scroll.setWidget(left_scroll_content)
         left.addWidget(left_scroll, 4)
 
-        body.addLayout(left, 4)
+        body_scroll_layout.addLayout(left, 4)
 
         right = QVBoxLayout(); right.setSpacing(6)
         right.addWidget(self._sec("INTEGRATED LOCAL CHAT INTERFACE"))
@@ -1226,8 +1254,10 @@ class AIAnalysisPage(QWidget):
         self.local_send_btn.clicked.connect(self.submit_embedded_local_chat)
         chat_inp_row.addWidget(self.local_msg_input, 1); chat_inp_row.addWidget(self.local_attach_btn); chat_inp_row.addWidget(self.local_send_btn)
         right.addLayout(chat_inp_row)
-        body.addLayout(right, 6)
-        lay.addLayout(body)
+        body_scroll_layout.addLayout(right, 6)
+
+        body_scroll.setWidget(body_scroll_content)
+        lay.addWidget(body_scroll, 1)
 
         lay.addWidget(self._build_terminal_panel())
         return w
@@ -1235,14 +1265,20 @@ class AIAnalysisPage(QWidget):
     def _build_terminal_panel(self):
         frame, lay = self._card()
         lay.addWidget(self._sec("TERMINAL"))
+        self.terminal_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.terminal_splitter.setStyleSheet("QSplitter::handle { background: #1a1a1a; height: 3px; }")
         self.terminal_output = QTextEdit()
         self.terminal_output.setReadOnly(True)
-        self.terminal_output.setFixedHeight(120)
         self.terminal_output.setStyleSheet(
             "QTextEdit { background: #0a0a0a; border: 1px solid #252525; color: #00ff00; "
             "font-family: 'Consolas', 'Courier New', monospace; font-size: 11px; }")
         self.terminal_output.setPlainText("Pandu Terminal v1.0\nType a command below and press Enter.\n")
-        lay.addWidget(self.terminal_output)
+        placeholder = QWidget()
+        placeholder.setMinimumHeight(40)
+        self.terminal_splitter.addWidget(self.terminal_output)
+        self.terminal_splitter.addWidget(placeholder)
+        self.terminal_splitter.setSizes([120, 40])
+        lay.addWidget(self.terminal_splitter)
 
         cmd_row = QHBoxLayout()
         prompt_lbl = QLabel("$")
@@ -1285,7 +1321,18 @@ class AIAnalysisPage(QWidget):
 
     def _build_cloud_panel(self):
         w = QWidget(); lay = QVBoxLayout(w); lay.setContentsMargins(0, 0, 0, 0); lay.setSpacing(6)
-        body = QHBoxLayout(); body.setSpacing(10)
+
+        # Wrap the entire body in a horizontal scroll area
+        body_scroll = QScrollArea()
+        body_scroll.setWidgetResizable(True)
+        body_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        body_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        body_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        body_scroll_content = QWidget()
+        body_scroll_layout = QHBoxLayout(body_scroll_content)
+        body_scroll_layout.setContentsMargins(0, 0, 0, 0)
+        body_scroll_layout.setSpacing(10)
+
         left = QVBoxLayout(); left.setSpacing(6)
 
         left_scroll = QScrollArea()
@@ -1321,7 +1368,6 @@ class AIAnalysisPage(QWidget):
         self.cloud_api_key_input = QLineEdit()
         self.cloud_api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
         self.cloud_api_key_input.setPlaceholderText("API key for selected provider...")
-        self.cloud_api_key_input.setText(CURRENT_SETTINGS.get("gemini_api_key", ""))
         self.cloud_api_key_input.editingFinished.connect(self.save_cloud_api_key)
         save_key_btn = QPushButton("Save"); save_key_btn.setFixedWidth(46)
         save_key_btn.clicked.connect(self.save_cloud_api_key)
@@ -1340,7 +1386,7 @@ class AIAnalysisPage(QWidget):
         left.addWidget(self._build_terminal_panel())
         left.addStretch()
 
-        body.addLayout(left, 4)
+        body_scroll_layout.addLayout(left, 4)
 
         right = QVBoxLayout(); right.setSpacing(6)
         right.addWidget(self._sec("INTEGRATED CLOUD CHAT INTERFACE"))
@@ -1369,15 +1415,17 @@ class AIAnalysisPage(QWidget):
         self.cloud_send_btn.clicked.connect(self.submit_embedded_cloud_chat)
         chat_inp_row.addWidget(self.cloud_msg_input, 1); chat_inp_row.addWidget(self.cloud_attach_btn); chat_inp_row.addWidget(self.cloud_send_btn)
         right.addLayout(chat_inp_row)
-        body.addLayout(right, 6)
-        lay.addLayout(body)
+        body_scroll_layout.addLayout(right, 6)
+
+        body_scroll.setWidget(body_scroll_content)
+        lay.addWidget(body_scroll, 1)
         self.update_cloud_status()
         return w
 
     def _update_cloud_models(self, provider):
         self.cloud_model_combo.clear()
         model_map = {
-            "Gemini": ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"],
+            "Gemini": ["gemini-3.5-flash", "gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"],
             "OpenAI": ["gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"],
             "Anthropic": ["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"],
             "Mistral": ["mistral-large", "mistral-medium", "mistral-small"]
@@ -1397,10 +1445,11 @@ class AIAnalysisPage(QWidget):
 
     def save_cloud_api_key(self):
         k = self.cloud_api_key_input.text().strip()
-        CURRENT_SETTINGS["gemini_api_key"] = k
-        save_settings(CURRENT_SETTINGS)
+        # API key is kept in memory only (in the QLineEdit widget).
+        # It is NOT saved to disk for security reasons.
+        # On application restart, the user must re-enter the key.
         self.update_cloud_status()
-        self.append_log("[Cloud] Connection credentials saved.")
+        self.append_log("[Cloud] API key stored in memory for this session.")
 
     def update_cloud_status(self):
         k = self.cloud_api_key_input.text().strip()
@@ -1459,7 +1508,6 @@ class AIAnalysisPage(QWidget):
 
     def get_gemini_api_key(self):
         return (self.cloud_api_key_input.text().strip() or
-                CURRENT_SETTINGS.get("gemini_api_key", "") or
                 os.environ.get("GOOGLE_CLOUD_API_KEY", ""))
 
     def pause_analysis(self):
@@ -2029,9 +2077,9 @@ class TrainPage(QWidget):
         self._training_records = []
         self.setup_ui()
 
-    def _sec(self, text):
+    def _sec(self, text, border=""):
         l = QLabel(text)
-        l.setStyleSheet("color: #383838; font-size: 9px; font-weight: bold; letter-spacing: 2px; margin-top: 6px;")
+        l.setStyleSheet(f"color: #383838; font-size: 9px; font-weight: bold; letter-spacing: 2px; margin-top: 6px; background: transparent; border: none;")
         return l
 
     def _card(self):
@@ -2058,6 +2106,17 @@ class TrainPage(QWidget):
             QHeaderView::section { background: #111111; border: 1px solid #1a1a1a; color: #888888; font-weight: bold; padding: 4px; }
         """)
         root = QVBoxLayout(self); root.setContentsMargins(10, 10, 10, 10); root.setSpacing(8)
+
+        # Wrap the top section in a horizontal scroll area
+        top_scroll = QScrollArea()
+        top_scroll.setWidgetResizable(True)
+        top_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        top_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        top_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        top_scroll_content = QWidget()
+        top_scroll_content.setStyleSheet("background: transparent;")
+        top_scroll_layout = QHBoxLayout(top_scroll_content)
+        top_scroll_layout.setContentsMargins(0, 0, 0, 0)
 
         top_layout = QHBoxLayout(); top_layout.setSpacing(10)
 
@@ -2236,7 +2295,9 @@ class TrainPage(QWidget):
         right_layout.addWidget(logs_card, 1)
         top_layout.addLayout(right_layout, 5)
 
-        root.addLayout(top_layout, 1)
+        top_scroll_layout.addLayout(top_layout)
+        top_scroll.setWidget(top_scroll_content)
+        root.addWidget(top_scroll, 1)
 
         bottom_card, bottom_lay = self._card()
         bottom_lay.addWidget(self._sec("TRAINED SCRIPT MODELS"))
@@ -2666,9 +2727,9 @@ class ScriptAnalysisPage(QWidget):
         self._analysis_result_data = {}  # Stores parsed data for PDF generation
         self.setup_ui()
 
-    def _sec(self, text):
+    def _sec(self, text, border=""):
         l = QLabel(text)
-        l.setStyleSheet("color: #383838; font-size: 9px; font-weight: bold; letter-spacing: 2px; margin-top: 6px;")
+        l.setStyleSheet(f"color: #383838; font-size: 9px; font-weight: bold; letter-spacing: 2px; margin-top: 6px; background: transparent; border: none;")
         return l
 
     def _card(self):
@@ -2697,13 +2758,23 @@ class ScriptAnalysisPage(QWidget):
         root = QVBoxLayout(self); root.setContentsMargins(10, 10, 10, 10); root.setSpacing(8)
 
         # ── TOP SECTION: Drag & Drop Image Upload + Selection + Analyse ──
+        top_scroll = QScrollArea()
+        top_scroll.setWidgetResizable(True)
+        top_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        top_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        top_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        top_scroll_content = QWidget()
+        top_scroll_content.setStyleSheet("background: transparent;")
+        top_scroll_lay = QHBoxLayout(top_scroll_content)
+        top_scroll_lay.setContentsMargins(0, 0, 0, 0)
+
         top_frame = QFrame()
         top_frame.setStyleSheet("QFrame { background: #0d0d0d; border: 1px solid #1a1a1a; border-radius: 5px; }")
         top_lay = QHBoxLayout(top_frame); top_lay.setContentsMargins(10, 10, 10, 10); top_lay.setSpacing(15)
 
         # LEFT: Drag-and-Drop Image Upload
         drop_frame = QFrame()
-        drop_frame.setStyleSheet("QFrame { background: #0a0a0a; border: 2px dashed #3a3a3a; border-radius: 8px; }")
+        drop_frame.setStyleSheet("QFrame { background: #0a0a0a; border: none; border-radius: 8px; }")
         drop_lay = QVBoxLayout(drop_frame)
         drop_lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
@@ -2755,7 +2826,7 @@ class ScriptAnalysisPage(QWidget):
         self.image_preview = QLabel()
         self.image_preview.setFixedSize(120, 120)
         self.image_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_preview.setStyleSheet("background: #0a0a0a; border: 1px solid #1a1a1a; border-radius: 4px; color: #444; font-size: 10px;")
+        self.image_preview.setStyleSheet("background: #0a0a0a; border-radius: 4px; color: #444; font-size: 10px;")
         self.image_preview.setText("No image\nselected")
         self.image_preview.setScaledContents(True)
         controls_lay.addWidget(self.image_preview, alignment=Qt.AlignmentFlag.AlignCenter)
@@ -2782,7 +2853,7 @@ class ScriptAnalysisPage(QWidget):
 
         self.script_model_combo = QComboBox()
         self.script_model_combo.setMinimumWidth(180)
-        self.script_model_combo.addItems(["Local: " + m for m in ["llama3", "gemma2", "mistral"]] + ["Cloud: gemini-2.5-flash"])
+        self.script_model_combo.addItems(["Local: " + m for m in ["llama3", "gemma2", "mistral"]] + ["Cloud: gemini-3.5-flash", "Cloud: gemini-2.5-flash"])
         self.script_model_combo.setStyleSheet(
             "QComboBox { background: #0f0f0f; border: 1px solid #2a2a2a; border-radius: 4px; padding: 6px 10px; color: #dddddd; font-size: 12px; }"
             "QComboBox::drop-down { border: none; }")
@@ -2821,7 +2892,7 @@ class ScriptAnalysisPage(QWidget):
         self.full_preview = QLabel()
         self.full_preview.setMinimumSize(200, 180)
         self.full_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.full_preview.setStyleSheet("background: #050505; border: 1px solid #151515; border-radius: 4px; color: #444; font-size: 11px;")
+        self.full_preview.setStyleSheet("background: #050505; border-radius: 4px; color: #444; font-size: 11px;")
         self.full_preview.setText("Drop an image\nhere to preview")
         self.full_preview.setScaledContents(True)
         preview_lay.addWidget(self.full_preview, 1)
@@ -2833,7 +2904,9 @@ class ScriptAnalysisPage(QWidget):
 
         top_lay.addWidget(preview_frame, 2)
 
-        root.addWidget(top_frame, 2)
+        top_scroll_lay.addWidget(top_frame)
+        top_scroll.setWidget(top_scroll_content)
+        root.addWidget(top_scroll, 2)
 
         # ── BOTTOM SECTION: Results (Split into Translation + Probable + Charts) ──
         bottom_splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -2926,7 +2999,7 @@ class ScriptAnalysisPage(QWidget):
     def _drag_enter(self, event):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
-            self.drop_widget.setStyleSheet("background: #0a1a0a; border: 2px dashed #44aa44;")
+            self.drop_widget.setStyleSheet("background: #0a1a0a;")
 
     def _drag_leave(self, event):
         self.drop_widget.setStyleSheet("background: transparent;")
@@ -3072,8 +3145,7 @@ class ScriptAnalysisPage(QWidget):
 
         if is_cloud:
             # Use Gemini-style analysis
-            api_key = (CURRENT_SETTINGS.get("gemini_api_key", "") or
-                       os.environ.get("GOOGLE_CLOUD_API_KEY", ""))
+            api_key = os.environ.get("GOOGLE_CLOUD_API_KEY", "")
             if not api_key:
                 QMessageBox.warning(self, "No API Key", "Please configure a Gemini API key in AI Analysis settings.")
                 self.analyse_btn.setEnabled(True)
@@ -3480,15 +3552,38 @@ class ScriptAnalysisPage(QWidget):
 # ── Main Application Framework Window ─────────────────────────────────────────
 
 class MainWindow(QMainWindow):
+    SNAP_THRESHOLD = 15  # pixels from screen edge to trigger snap
+    SNAP_DELAY_MS = 150  # ms delay before snap triggers
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Pandu v1.8")
-        self.setMinimumSize(1000, 650)
+        self.setMinimumSize(800, 500)
         if os.path.exists(LOGO_PATH):
             app_icon = QIcon(LOGO_PATH)
             self.setWindowIcon(app_icon)
             QApplication.instance().setWindowIcon(app_icon)
         self.setStyleSheet("QMainWindow { background: #070707; }")
+
+        # Snap state tracking
+        self._snap_state = None  # None, "left", "right", "full"
+        self._pre_snap_geometry = None  # QRect before snap
+        self._snap_timer = QTimer(self)
+        self._snap_timer.setSingleShot(True)
+        self._snap_timer.timeout.connect(self._check_snap)
+        self._is_dragging = False
+        self._drag_start_pos = None
+        self._drag_start_geometry = None
+
+        # Detach button (shown when snapped)
+        self._detach_btn = QPushButton("⬡ Detach")
+        self._detach_btn.setFixedSize(80, 22)
+        self._detach_btn.setStyleSheet("""
+            QPushButton { background: #1a1a2a; border: 1px solid #3a3a5a; color: #8888cc; font-size: 9px; border-radius: 3px; }
+            QPushButton:hover { background: #2a2a3a; border-color: #5a5a8a; color: #aaaaff; }
+        """)
+        self._detach_btn.clicked.connect(self._detach_snap)
+        self._detach_btn.hide()
 
         w = QWidget(); self.setCentralWidget(w)
         layout = QVBoxLayout(w); layout.setContentsMargins(10, 10, 10, 10); layout.setSpacing(10)
@@ -3499,7 +3594,7 @@ class MainWindow(QMainWindow):
         if os.path.exists(LOGO_PATH):
             self.logo_lbl.setPixmap(QPixmap(LOGO_PATH).scaled(48, 48, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
         else:
-            self.logo_lbl.setStyleSheet("background: #111; border: 1px dashed #333;")
+            self.logo_lbl.setStyleSheet("background: #111;")
         header.addWidget(self.logo_lbl)
         title_col = QVBoxLayout(); title_col.setSpacing(2)
         t_lbl = QLabel("PANDU"); t_lbl.setStyleSheet("color: #ffffff; font-size: 16px; font-weight: bold; letter-spacing: 3px;")
@@ -3529,6 +3624,11 @@ class MainWindow(QMainWindow):
         self.btns["Data Entry"].setChecked(True)
         layout.addWidget(self.toolbar_frame)
 
+        self.main_scroll = QScrollArea()
+        self.main_scroll.setWidgetResizable(True)
+        self.main_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.main_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.main_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
         self.stack = QStackedWidget()
         self.data_page = DataPage()
         self.library_page = LibraryPage()
@@ -3546,7 +3646,8 @@ class MainWindow(QMainWindow):
             self.pages[name] = idx
         for page in pages:
             self.stack.addWidget(page)
-        layout.addWidget(self.stack, 1)
+        self.main_scroll.setWidget(self.stack)
+        layout.addWidget(self.main_scroll, 1)
 
         progress_row = QHBoxLayout()
         self.analysis_progress_bar = QProgressBar()
@@ -3575,6 +3676,138 @@ class MainWindow(QMainWindow):
         # Connect Script Analysis page progress to main progress bar
         self.script_analysis_page.progress_updated.connect(self._update_analysis_progress)
         self.script_analysis_page.analysis_completed.connect(self._on_analysis_completed)
+
+    # ── Snap-to-Side Gesture ──────────────────────────────────────────────
+
+    def _get_current_screen(self):
+        """Get the screen the window is currently on."""
+        cursor_pos = QCursor.pos()
+        screen = QApplication.screenAt(cursor_pos)
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        return screen
+
+    def _check_snap(self):
+        """Check if the window should snap to a screen edge."""
+        if not self._is_dragging:
+            return
+
+        screen = self._get_current_screen()
+        if screen is None:
+            return
+
+        screen_geo = screen.availableGeometry()
+        cursor_pos = QCursor.pos()
+        window_pos = self.pos()
+
+        # Check proximity to screen edges
+        near_left = cursor_pos.x() <= screen_geo.x() + self.SNAP_THRESHOLD
+        near_right = cursor_pos.x() >= screen_geo.right() - self.SNAP_THRESHOLD
+        near_top = cursor_pos.y() <= screen_geo.y() + self.SNAP_THRESHOLD
+
+        if near_left and near_top:
+            # Snap to left half
+            self._apply_snap("left", screen_geo)
+        elif near_right and near_top:
+            # Snap to right half
+            self._apply_snap("right", screen_geo)
+        elif near_top:
+            # Snap to full screen
+            self._apply_snap("full", screen_geo)
+
+    def _apply_snap(self, snap_type, screen_geo):
+        """Apply the snap to the specified position."""
+        if self._snap_state == snap_type:
+            return  # Already snapped
+
+        # Save pre-snap geometry if not already snapped
+        if self._snap_state is None:
+            self._pre_snap_geometry = self.geometry()
+
+        self._snap_state = snap_type
+
+        if snap_type == "left":
+            half_width = screen_geo.width() // 2
+            new_geo = QRect(screen_geo.x(), screen_geo.y(), half_width, screen_geo.height())
+        elif snap_type == "right":
+            half_width = screen_geo.width() // 2
+            new_geo = QRect(screen_geo.x() + half_width, screen_geo.y(), half_width, screen_geo.height())
+        elif snap_type == "full":
+            new_geo = screen_geo
+        else:
+            return
+
+        self.setGeometry(new_geo)
+        self._show_detach_button()
+
+    def _show_detach_button(self):
+        """Show the detach button overlay."""
+        self._detach_btn.show()
+        # Position the detach button in the top-right of the title area
+        self._detach_btn.setParent(self.centralWidget())
+        self._detach_btn.move(self.centralWidget().width() - 90, 2)
+        self._detach_btn.raise_()
+
+    def _detach_snap(self):
+        """Restore the window to its pre-snap position and size."""
+        if self._pre_snap_geometry is not None:
+            self.setGeometry(self._pre_snap_geometry)
+        self._snap_state = None
+        self._pre_snap_geometry = None
+        self._detach_btn.hide()
+
+    def mousePressEvent(self, event):
+        """Track drag start for snap detection."""
+        if event.button() == Qt.MouseButton.LeftButton:
+            # Check if we're clicking on the title bar area (top ~30px of window)
+            title_bar_rect = QRect(0, 0, self.width(), 30)
+            if title_bar_rect.contains(event.pos()):
+                self._is_dragging = True
+                self._drag_start_pos = event.globalPosition().toPoint()
+                self._drag_start_geometry = self.geometry()
+                # Start the snap timer
+                self._snap_timer.start(self.SNAP_DELAY_MS)
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        """Track mouse movement during drag for snap detection."""
+        if self._is_dragging and event.buttons() & Qt.MouseButton.LeftButton:
+            # Restart the snap timer on each move to keep checking
+            self._snap_timer.start(self.SNAP_DELAY_MS)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        """End drag tracking."""
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._is_dragging = False
+            self._snap_timer.stop()
+            self._drag_start_pos = None
+            self._drag_start_geometry = None
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        """Double-click to toggle snap/detach."""
+        if event.button() == Qt.MouseButton.LeftButton:
+            title_bar_rect = QRect(0, 0, self.width(), 30)
+            if title_bar_rect.contains(event.pos()):
+                if self._snap_state is not None:
+                    self._detach_snap()
+                else:
+                    # Maximize on double-click
+                    if self.isMaximized():
+                        self.showNormal()
+                    else:
+                        self.showMaximized()
+                return
+        super().mouseDoubleClickEvent(event)
+
+    def resizeEvent(self, event):
+        """Handle resize to reposition detach button and update scrollbars."""
+        super().resizeEvent(event)
+        if self._detach_btn.isVisible():
+            self._detach_btn.move(self.centralWidget().width() - 90, 2)
+
+    # ── Existing Methods ──────────────────────────────────────────────────
 
     def _update_analysis_progress(self, value):
         self.analysis_progress_bar.setValue(value)
