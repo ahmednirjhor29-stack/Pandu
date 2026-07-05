@@ -90,7 +90,7 @@ python "Pandu v1.7.py"
 
 ## License
 
-Copyright (C) 2026 Ahmed Nirjhor
+Copyright (C) 2026 Shah Aziz Ahmed
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
