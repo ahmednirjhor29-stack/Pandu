@@ -16,7 +16,6 @@ import hashlib
 from fpdf import FPDF
 import cv2
 import numpy as np
-from skimage.morphology import medial_axis, skeletonize
 from skimage.measure import label, regionprops
 from scipy.spatial import procrustes
 from scipy.spatial.distance import directed_hausdorff
@@ -32,10 +31,10 @@ from PyQt6.QtWidgets import (
     QPushButton, QLineEdit, QComboBox, QHBoxLayout, QMessageBox,
     QProgressBar, QScrollArea, QInputDialog, QStackedWidget, QTableWidget,
     QTableWidgetItem, QHeaderView, QDialog, QTextEdit, QFrame, QSizePolicy,
-    QTabWidget, QGridLayout, QGroupBox, QSplitter, QToolButton
+    QTabWidget, QGridLayout, QGroupBox, QSplitter, QToolButton, QButtonGroup
 )
 from PyQt6.QtGui import QIcon, QPixmap, QColor, QFont, QTextCursor, QPainter, QBrush, QPen, QFontMetrics, QLinearGradient, QCursor, QDesktopServices
-from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer, QRect, QSize, QPoint, QUrl
+from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer, QRect, QSize, QPoint, QUrl, QPointF
 
 SETTINGS_FILE = os.path.join(os.path.expanduser("~"), ".pandu_settings.json")
 DEFAULT_DB_DIR = os.path.join(os.path.expanduser("~"), ".pandu_database")
@@ -54,7 +53,7 @@ DEFAULT_SETTINGS = {
         "gaussian_blur_k": 5,
         "adaptive_threshold_block": 11,
         "adaptive_threshold_c": 2,
-        "min_branch_length": 3,
+        "polygon_sample_points": 36,
         "aspect_ratio_weight": 1.0,
         "solidity_weight": 1.0
     }
@@ -306,6 +305,42 @@ def make_json_safe(value):
     if isinstance(value, (np.floating,)):
         return float(value)
     return value
+
+def render_glyph_trace_overlay(image_path, traces, out_path):
+    img = cv2.imread(image_path)
+    if img is None:
+        return ""
+    overlay = img.copy()
+    for idx, trace in enumerate(traces):
+        polygon = trace.get("outline_polygon", [])
+        triangles = trace.get("triangle_mesh", [])
+        for tri in triangles:
+            if len(tri) == 3:
+                cv2.polylines(overlay, [np.array(tri, dtype=np.int32)], True, (0, 180, 255), 1, cv2.LINE_AA)
+        if polygon:
+            pts = np.array(polygon, dtype=np.int32)
+            cv2.polylines(overlay, [pts], True, (255, 255, 255), 3, cv2.LINE_AA)
+            for px, py in polygon:
+                cv2.circle(overlay, (int(px), int(py)), 3, (0, 255, 255), -1, cv2.LINE_AA)
+            x, y, w, h = cv2.boundingRect(pts)
+        else:
+            bbox = trace.get("bbox", [])
+            if len(bbox) != 4:
+                continue
+            x, y, w, h = [int(v) for v in bbox]
+            cv2.rectangle(overlay, (x, y), (x + w, y + h), (255, 255, 255), 2, cv2.LINE_AA)
+        label = f"G{trace.get('glyph_index', idx)}"
+        cv2.putText(overlay, label, (x, max(18, y - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.putText(overlay, label, (x, max(18, y - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+    summary = f"AI glyph border trace: glyphs={len(traces)}"
+    cv2.rectangle(overlay, (8, 8), (min(img.shape[1] - 8, 520), 42), (0, 0, 0), -1)
+    cv2.putText(overlay, summary, (16, 31),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 1, cv2.LINE_AA)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    cv2.imwrite(out_path, overlay)
+    return out_path
 
 # ── Permission Manager ────────────────────────────────────────────────────────
 
@@ -876,10 +911,10 @@ class PipelineSettingsDialog(QDialog):
         form_layout.addWidget(self.c_input, 3, 1)
 
         # Phase 2: Geometric Configurations
-        form_layout.addWidget(QLabel("<b>Phase 2: Mathematical Skeleton Metrics</b>"), 4, 0, 1, 2)
+        form_layout.addWidget(QLabel("<b>Phase 2: Polygon / Triangle Metrics</b>"), 4, 0, 1, 2)
 
-        form_layout.addWidget(QLabel("Minimum Branch Pruning Length:"), 5, 0)
-        self.prune_input = QLineEdit(str(self.config.get("min_branch_length", 3)))
+        form_layout.addWidget(QLabel("Polygon Boundary Sample Points:"), 5, 0)
+        self.prune_input = QLineEdit(str(self.config.get("polygon_sample_points", self.config.get("min_branch_length", 36))))
         form_layout.addWidget(self.prune_input, 5, 1)
 
         form_layout.addWidget(QLabel("Feature Normalization Aspect Weight:"), 6, 0)
@@ -908,7 +943,7 @@ class PipelineSettingsDialog(QDialog):
             self.config["gaussian_blur_k"] = int(self.blur_input.text())
             self.config["adaptive_threshold_block"] = int(self.block_input.text())
             self.config["adaptive_threshold_c"] = int(self.c_input.text())
-            self.config["min_branch_length"] = int(self.prune_input.text())
+            self.config["polygon_sample_points"] = int(self.prune_input.text())
             self.config["aspect_ratio_weight"] = float(self.aspect_input.text())
             self.config["solidity_weight"] = float(self.solidity_input.text())
 
@@ -2161,9 +2196,11 @@ class AIAnalysisPage(QWidget):
         prompt = (
             "Analyse only the visible text, script, ancient text, glyphs, symbols, marks, and letter-like forms in this image. "
             "Do not translate unless a transcription is visibly supported. Do not identify unrelated artifact details except where they affect script extraction. "
+            "Pay special attention to color contrast, ink/background contrast, and precise glyph border separation. "
             "Return structured extraction data with these headings:\n"
             "VISIBLE SCRIPT DETECTION:\n"
             "GLYPH / CHARACTER CANDIDATES:\n"
+            "PRECISE GLYPH BORDER / CONTRAST NOTES:\n"
             "TRANSCRIPTION IF VISIBLE:\n"
             "WRITING SYSTEM CLUES:\n"
             "DAMAGED OR UNCERTAIN STROKES:\n"
@@ -2317,6 +2354,7 @@ class AIAnalysisPage(QWidget):
                 (os.path.basename(img_path), CURRENT_SETTINGS.get("active_model", ""), "N/A", result, "N/A",
                  "AI script/text extraction phase", inferred_ws, ""))
             ai_path = self._save_ai_extraction_result(img_path, result, inferred_ws)
+            trace_info = self._save_ai_traced_glyphs(img_path, record_id, inferred_ws)
             self._pipeline_record_ids.append(record_id)
             self._pipeline_ai_json_path = ai_path
             self._write_pipeline_progress("running")
@@ -2326,6 +2364,8 @@ class AIAnalysisPage(QWidget):
             else:
                 self.progress_updated.emit(70)
             self.append_log(f"[Pipeline] AI extraction saved: {ai_path}")
+            if trace_info.get("glyph_count", 0):
+                self.append_log(f"[Pipeline] AI contrast glyph tracing saved {trace_info.get('glyph_count')} glyph(s).")
         elif not self._analysis_stopped:
             self.append_log(f"[Analysis Error] {err}")
             self.progress_updated.emit(0)
@@ -2333,6 +2373,118 @@ class AIAnalysisPage(QWidget):
         self._analysis_total_chunks = 0
         self._analysis_chunks_received = 0
         self._analysis_saved_count = 0
+
+    def _save_ai_traced_glyphs(self, img_path, record_id, writing_system):
+        if not img_path or not os.path.exists(img_path):
+            return {"glyph_count": 0, "overlay_path": "", "report": {}}
+        try:
+            analyzer = ScientificGlyphAnalyzer()
+            phase1 = analyzer.phase1_clean_and_extract(img_path)
+            phase2 = analyzer.phase2_geometric_analysis(phase1)
+            report = phase2.get("overall_report", {})
+            per_glyph = report.get("per_glyph", []) if isinstance(report, dict) else []
+            glyph_dir = ensure_ai_glyph_folder()
+            _, math_dir = ensure_ai_pipeline_folders()
+            stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.splitext(os.path.basename(img_path))[0] or "image")
+            source = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
+            traces = []
+
+            for idx, item in enumerate(per_glyph):
+                bbox = item.get("bbox", [])
+                if len(bbox) != 4:
+                    continue
+                x, y, w, h = [int(v) for v in bbox]
+                geometry = item.get("geometry", {}) if isinstance(item, dict) else {}
+                outline = geometry.get("outline_polygon", []) if isinstance(geometry, dict) else []
+                triangles = geometry.get("triangle_mesh", []) if isinstance(geometry, dict) else []
+                glyph_path = os.path.join(glyph_dir, f"{stamp}_{safe_name}_ai_glyph_{idx}.png")
+                data_path = os.path.join(glyph_dir, f"{stamp}_{safe_name}_ai_glyph_{idx}.json")
+                self._write_precise_glyph_cutout(source, glyph_path, bbox, outline)
+                data = {
+                    "artifact_name": os.path.basename(img_path),
+                    "source_image_path": img_path,
+                    "ai_analysis_record_id": record_id,
+                    "glyph_image_path": glyph_path,
+                    "glyph_index": idx,
+                    "bbox": bbox,
+                    "area": item.get("morphological", {}).get("area", ""),
+                    "glyph_name": "",
+                    "modern_equivalent": "",
+                    "writing_system": writing_system,
+                    "notes": "AI contrast-based precise glyph border trace.",
+                    "geometric_data": {
+                        "outline_polygon": outline,
+                        "triangle_mesh": triangles,
+                        "shape_vector": geometry.get("shape_vector", []),
+                        "triangle_areas": geometry.get("triangle_areas", []),
+                        "triangle_angles": geometry.get("triangle_angles", []),
+                    },
+                    "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                with open(data_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+                run_ai_insert(
+                    "INSERT INTO ai_glyphs (artifact_name, source_image_path, glyph_image_path, glyph_data_path, glyph_index, bbox, glyph_name, modern_equivalent, writing_system, notes, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        os.path.basename(img_path), img_path, glyph_path, data_path, idx, json.dumps(bbox),
+                        "", "", writing_system, f"AI record {record_id}: contrast traced glyph border",
+                        datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    )
+                )
+                traces.append({
+                    "glyph_index": idx,
+                    "bbox": bbox,
+                    "outline_polygon": outline,
+                    "triangle_mesh": triangles,
+                })
+
+            overlay_path = os.path.join(math_dir, f"{stamp}_{safe_name}_ai_glyph_trace.png")
+            if traces:
+                render_glyph_trace_overlay(img_path, traces, overlay_path)
+            summary = report.get("summary", {}) if isinstance(report, dict) else {}
+            run_ai_query(
+                "UPDATE ai_analysis_db SET image_path=?, analyzed_area_image_path=?, glyphs_detected=?, total_glyph_area_px=?, "
+                "avg_complexity_score=?, total_junction_points=?, total_endpoints=?, total_stroke_branches=?, "
+                "confidence_score=?, notes=?, letter_forms=? WHERE id=?",
+                (
+                    img_path, overlay_path, summary.get("glyphs_detected", len(traces)),
+                    summary.get("total_glyph_area_px"), summary.get("avg_complexity_score"),
+                    summary.get("total_junction_points"), summary.get("total_endpoints"),
+                    summary.get("total_stroke_branches"), "AI + contrast glyph tracing",
+                    "AI script/text extraction phase with precise contrast glyph border tracing.",
+                    json.dumps({"glyph_trace_report": report}, indent=2),
+                    record_id
+                )
+            )
+            return {"glyph_count": len(traces), "overlay_path": overlay_path, "report": report}
+        except Exception as exc:
+            self.append_log(f"[AI Glyph Trace Error] {exc}")
+            return {"glyph_count": 0, "overlay_path": "", "report": {}}
+
+    def _write_precise_glyph_cutout(self, source, out_path, bbox, outline):
+        if source is None:
+            return ""
+        x, y, w, h = [int(v) for v in bbox]
+        crop = source[y:y + h, x:x + w]
+        if crop.size == 0:
+            return ""
+        if crop.ndim == 2:
+            crop_bgra = cv2.cvtColor(crop, cv2.COLOR_GRAY2BGRA)
+        elif crop.shape[2] == 4:
+            crop_bgra = crop.copy()
+        else:
+            crop_bgra = cv2.cvtColor(crop, cv2.COLOR_BGR2BGRA)
+        alpha = np.zeros((h, w), dtype=np.uint8)
+        if outline:
+            local = np.array([[int(px) - x, int(py) - y] for px, py in outline], dtype=np.int32)
+            cv2.fillPoly(alpha, [local], 255)
+        else:
+            alpha[:, :] = 255
+        crop_bgra[:, :, 3] = alpha
+        cv2.imwrite(out_path, crop_bgra)
+        return out_path
 
     def _finished_geometric_analysis(self, success, err, result):
         img_path = self._current_pipeline_image_path or self.img_selector_combo.currentData() or ""
@@ -2463,10 +2615,10 @@ class AIAnalysisPage(QWidget):
                 ("Glyphs detected", summary.get("glyphs_detected", "N/A")),
                 ("Total glyph area px", summary.get("total_glyph_area_px", "N/A")),
                 ("Average complexity", summary.get("avg_complexity_score", "N/A")),
-                ("Junction points", summary.get("total_junction_points", "N/A")),
-                ("Endpoints", summary.get("total_endpoints", "N/A")),
-                ("Stroke branches", summary.get("total_stroke_branches", "N/A")),
-                ("Branches per glyph", summary.get("branches_per_glyph", "N/A")),
+                ("Polygon vertices", summary.get("total_polygon_vertices", summary.get("total_junction_points", "N/A"))),
+                ("Triangle cells", summary.get("total_triangle_cells", summary.get("total_endpoints", "N/A"))),
+                ("Polygon edges", summary.get("total_polygon_edges", summary.get("total_stroke_branches", "N/A"))),
+                ("Triangles per glyph", summary.get("avg_triangles_per_glyph", "N/A")),
             ]
             for label, value in metric_rows:
                 self._pdf_kv(pdf, label, value)
@@ -2490,8 +2642,10 @@ class AIAnalysisPage(QWidget):
                     morph = item.get("morphological", {})
                     line = (
                         f"Glyph {item.get('glyph')}: bbox={item.get('bbox')} | "
-                        f"junctions={structural.get('junctions')} endpoints={structural.get('endpoints')} "
-                        f"branches={structural.get('branches')} complexity={morph.get('complexity')} "
+                        f"vertices={structural.get('polygon_vertices', structural.get('junctions'))} "
+                        f"triangles={structural.get('triangle_cells', structural.get('endpoints'))} "
+                        f"edges={structural.get('polygon_edges', structural.get('branches'))} "
+                        f"complexity={morph.get('complexity')} "
                         f"area={morph.get('area')} solidity={morph.get('solidity')}"
                     )
                     pdf.multi_cell(0, 4.5, pdf_safe_text(line))
@@ -2576,22 +2730,22 @@ class AIAnalysisPage(QWidget):
     def _build_pipeline_human_explanation(self, ai_text, summary, per_glyph):
         glyph_count = summary.get("glyphs_detected", len(per_glyph) if per_glyph else "unknown")
         complexity = summary.get("avg_complexity_score", "unknown")
-        junctions = summary.get("total_junction_points", "unknown")
-        endpoints = summary.get("total_endpoints", "unknown")
-        branches = summary.get("total_stroke_branches", "unknown")
+        vertices = summary.get("total_polygon_vertices", summary.get("total_junction_points", "unknown"))
+        triangles = summary.get("total_triangle_cells", summary.get("total_endpoints", "unknown"))
+        edges = summary.get("total_polygon_edges", summary.get("total_stroke_branches", "unknown"))
         return (
             "Pandu analysed this image in two cooperating phases. First, the AI extraction phase read the visible "
             "marks as possible script, letter-like forms, damaged strokes, and writing-system clues. Second, the "
-            "deterministic geometry phase treated the image as shapes: it isolated glyph candidates, skeletonized "
-            "their strokes, and measured structural features such as junctions, endpoints, branch count, area, and "
-            "complexity.\n\n"
+            "deterministic geometry phase treated each mark as a calculable shape: it isolated glyph candidates, "
+            "traced each glyph boundary as a polygon, filled that boundary with triangular cells, and recorded a "
+            "shape vector from polygon and triangle measurements.\n\n"
             f"The geometric phase found {glyph_count} glyph candidate(s). Their average complexity score was "
-            f"{complexity}, with {junctions} junction point(s), {endpoints} endpoint(s), and {branches} stroke "
-            "branch(es). High junction and branch counts usually indicate more complex letterforms or overlapping "
-            "strokes; low counts usually indicate simple marks, erosion, or incomplete characters.\n\n"
+            f"{complexity}, with {vertices} polygon vertex point(s), {triangles} triangle cell(s), and {edges} "
+            "polygon edge(s). Higher vertex and triangle counts usually indicate more detailed letterforms, interior "
+            "holes, or damaged/irregular boundaries; lower counts usually indicate simpler marks or incomplete forms.\n\n"
             "The final interpretation is based on agreement between what the AI described in natural language and "
             "what the geometry measured in the image. If the AI mentions script-like strokes and the geometry also "
-            "finds coherent glyph regions with measurable skeleton structure, Pandu treats the analysis as stronger. "
+            "finds coherent glyph regions with stable polygon and triangle structure, Pandu treats the analysis as stronger. "
             "If either phase is weak, the report should be read as uncertain and checked by a human specialist."
         )
 
@@ -2642,8 +2796,8 @@ class AIAnalysisPage(QWidget):
         out_path = os.path.join(math_dir, f"{stamp}_{safe_name}_geometric_analysis.json")
         data = {
             "image_path": img_path,
-            "phase": "Geometric Hard Math",
-            "pipeline": "[Raw Image/3D Scan] -> [Perfect Vector Skeleton] -> [Scientific Analysis]",
+            "phase": "Polygon Geometric Analysis",
+            "pipeline": "[Raw Image] -> [Glyph Boundary Polygons] -> [Triangle Mesh Shape Data] -> [Scientific Analysis]",
             "result": make_json_safe(result)
         }
         with open(out_path, "w", encoding="utf-8") as f:
@@ -2664,7 +2818,21 @@ class AIAnalysisPage(QWidget):
             x, y, w, h = [int(v) for v in bbox]
             roi = img[y:y + h, x:x + w]
             polygon_drawn = False
-            if roi.size:
+            geometry = item.get("geometry", {}) if isinstance(item, dict) else {}
+            triangle_mesh = geometry.get("triangle_mesh", []) if isinstance(geometry, dict) else []
+            outline_polygon = geometry.get("outline_polygon", []) if isinstance(geometry, dict) else []
+            for tri in triangle_mesh:
+                if len(tri) == 3:
+                    pts = np.array(tri, dtype=np.int32)
+                    cv2.polylines(overlay, [pts], True, (0, 180, 255), 1, cv2.LINE_AA)
+                    polygon_drawn = True
+            if outline_polygon:
+                pts = np.array(outline_polygon, dtype=np.int32)
+                cv2.polylines(overlay, [pts], True, (255, 255, 255), 3, cv2.LINE_AA)
+                for px, py in outline_polygon:
+                    cv2.circle(overlay, (int(px), int(py)), 2, (0, 255, 255), -1, cv2.LINE_AA)
+                polygon_drawn = True
+            if roi.size and not polygon_drawn:
                 gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
                 blur = cv2.GaussianBlur(gray, (3, 3), 0)
                 _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
@@ -2679,10 +2847,6 @@ class AIAnalysisPage(QWidget):
                     poly[:, 0, 1] += y
                     cv2.polylines(overlay, [poly], True, (255, 255, 255), 3, cv2.LINE_AA)
                     polygon_drawn = True
-                    skeleton = medial_axis(thresh > 0).astype(np.uint8) * 255
-                    ys, xs = np.where(skeleton > 0)
-                    if len(xs) > 0:
-                        overlay[y + ys, x + xs] = (255, 255, 0)
                 if not polygon_drawn:
                     pts = np.array([[[x, y]], [[x + w, y]], [[x + w, y + h]], [[x, y + h]]], dtype=np.int32)
                     cv2.polylines(overlay, [pts], True, (255, 255, 255), 3, cv2.LINE_AA)
@@ -2694,9 +2858,9 @@ class AIAnalysisPage(QWidget):
             cv2.rectangle(overlay, (x, y), (x + w, y + h), (60, 180, 255), 1, cv2.LINE_AA)
             label = f"G{item.get('glyph', '')}"
             metrics = (
-                f"{label} J{structural.get('junctions', 0)} "
-                f"E{structural.get('endpoints', 0)} "
-                f"B{structural.get('branches', 0)} "
+                f"{label} V{structural.get('polygon_vertices', structural.get('junctions', 0))} "
+                f"T{structural.get('triangle_cells', structural.get('endpoints', 0))} "
+                f"E{structural.get('polygon_edges', structural.get('branches', 0))} "
                 f"C{morph.get('complexity', 0)}"
             )
             text_y = max(18, y - 8)
@@ -2706,8 +2870,9 @@ class AIAnalysisPage(QWidget):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
         summary = report.get("summary", {}) if isinstance(report, dict) else {}
         summary_text = (
-            f"Geometric text analysis: glyphs={summary.get('glyphs_detected', len(per_glyph))} "
+            f"Polygon text analysis: glyphs={summary.get('glyphs_detected', len(per_glyph))} "
             f"area={summary.get('total_glyph_area_px', 'N/A')} "
+            f"triangles={summary.get('total_triangle_cells', summary.get('total_endpoints', 'N/A'))} "
             f"avg_complexity={summary.get('avg_complexity_score', 'N/A')}"
         )
         cv2.rectangle(overlay, (8, 8), (min(img.shape[1] - 8, 760), 42), (0, 0, 0), -1)
@@ -2847,6 +3012,294 @@ class EditAIDialog(QDialog):
             self.entry_id
         )
 
+class GlyphTraceCanvas(QWidget):
+    tracesChanged = pyqtSignal()
+
+    def __init__(self, image_path, traces, parent=None):
+        super().__init__(parent)
+        self.image_path = image_path
+        self.traces = traces
+        self.editing = False
+        self.mode = "move"
+        self.selected = None
+        self._dragging = False
+        self._pixmap = QPixmap(image_path)
+        self.setMinimumSize(700, 520)
+        self.setMouseTracking(True)
+
+    def set_editing(self, enabled):
+        self.editing = enabled
+        self.setCursor(Qt.CursorShape.CrossCursor if enabled else Qt.CursorShape.ArrowCursor)
+        self.update()
+
+    def set_mode(self, mode):
+        self.mode = mode
+        self.update()
+
+    def _image_rect(self):
+        if self._pixmap.isNull():
+            return QRect(0, 0, self.width(), self.height())
+        scaled = self._pixmap.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        x = (self.width() - scaled.width()) // 2
+        y = (self.height() - scaled.height()) // 2
+        return QRect(x, y, scaled.width(), scaled.height())
+
+    def _image_to_widget(self, point):
+        rect = self._image_rect()
+        if self._pixmap.isNull():
+            return QPointF(point[0], point[1])
+        sx = rect.width() / max(self._pixmap.width(), 1)
+        sy = rect.height() / max(self._pixmap.height(), 1)
+        return QPointF(rect.x() + point[0] * sx, rect.y() + point[1] * sy)
+
+    def _widget_to_image(self, pos):
+        rect = self._image_rect()
+        if self._pixmap.isNull() or not rect.contains(pos):
+            return None
+        sx = self._pixmap.width() / max(rect.width(), 1)
+        sy = self._pixmap.height() / max(rect.height(), 1)
+        x = (pos.x() - rect.x()) * sx
+        y = (pos.y() - rect.y()) * sy
+        return [int(max(0, min(self._pixmap.width() - 1, round(x)))),
+                int(max(0, min(self._pixmap.height() - 1, round(y))))]
+
+    def _nearest_anchor(self, pos, max_dist=12):
+        best = None
+        best_dist = max_dist
+        for gi, trace in enumerate(self.traces):
+            poly = trace.get("outline_polygon", [])
+            for pi, point in enumerate(poly):
+                wp = self._image_to_widget(point)
+                dist = math.hypot(wp.x() - pos.x(), wp.y() - pos.y())
+                if dist < best_dist:
+                    best = (gi, pi)
+                    best_dist = dist
+        return best
+
+    def _nearest_edge_insert_index(self, pos):
+        best = None
+        best_dist = 999999.0
+        for gi, trace in enumerate(self.traces):
+            poly = trace.get("outline_polygon", [])
+            if len(poly) < 2:
+                continue
+            for pi, p1 in enumerate(poly):
+                p2 = poly[(pi + 1) % len(poly)]
+                dist = self._distance_to_segment(pos, self._image_to_widget(p1), self._image_to_widget(p2))
+                if dist < best_dist:
+                    best = (gi, pi + 1)
+                    best_dist = dist
+        return best if best_dist < 24 else None
+
+    def _distance_to_segment(self, p, a, b):
+        ax, ay, bx, by = a.x(), a.y(), b.x(), b.y()
+        dx, dy = bx - ax, by - ay
+        if dx == 0 and dy == 0:
+            return math.hypot(p.x() - ax, p.y() - ay)
+        t = max(0, min(1, ((p.x() - ax) * dx + (p.y() - ay) * dy) / (dx * dx + dy * dy)))
+        px, py = ax + t * dx, ay + t * dy
+        return math.hypot(p.x() - px, p.y() - py)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#050505"))
+        rect = self._image_rect()
+        if not self._pixmap.isNull():
+            painter.drawPixmap(rect, self._pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        for gi, trace in enumerate(self.traces):
+            poly = trace.get("outline_polygon", [])
+            if len(poly) < 2:
+                continue
+            points = [self._image_to_widget(p) for p in poly]
+            pen = QPen(QColor("#ffffff"), 2)
+            painter.setPen(pen)
+            for i, p1 in enumerate(points):
+                p2 = points[(i + 1) % len(points)]
+                painter.drawLine(p1, p2)
+            painter.setPen(QPen(QColor("#00b4ff"), 1))
+            for tri in trace.get("triangle_mesh", []):
+                if len(tri) == 3:
+                    tri_points = [self._image_to_widget(p) for p in tri]
+                    painter.drawLine(tri_points[0], tri_points[1])
+                    painter.drawLine(tri_points[1], tri_points[2])
+                    painter.drawLine(tri_points[2], tri_points[0])
+            for pi, p in enumerate(points):
+                selected = self.selected == (gi, pi)
+                painter.setBrush(QBrush(QColor("#ffcc33" if selected else "#00ffff")))
+                painter.setPen(QPen(QColor("#111111"), 1))
+                painter.drawEllipse(p, 5 if selected else 4, 5 if selected else 4)
+        if not self.editing:
+            painter.fillRect(QRect(12, 12, 240, 28), QColor(0, 0, 0, 170))
+            painter.setPen(QColor("#dddddd"))
+            painter.drawText(QRect(20, 12, 230, 28), Qt.AlignmentFlag.AlignVCenter, "Press Edit to adjust anchors")
+        painter.end()
+
+    def mousePressEvent(self, event):
+        if not self.editing or event.button() != Qt.MouseButton.LeftButton:
+            return super().mousePressEvent(event)
+        img_point = self._widget_to_image(event.pos())
+        if img_point is None:
+            return
+        nearest = self._nearest_anchor(event.pos())
+        if self.mode == "remove":
+            if nearest:
+                gi, pi = nearest
+                if len(self.traces[gi].get("outline_polygon", [])) > 3:
+                    self.traces[gi]["outline_polygon"].pop(pi)
+                    self.selected = None
+                    self.tracesChanged.emit()
+                    self.update()
+            return
+        if self.mode == "add":
+            insert_at = self._nearest_edge_insert_index(event.pos())
+            if insert_at:
+                gi, idx = insert_at
+                self.traces[gi].setdefault("outline_polygon", []).insert(idx, img_point)
+                self.selected = (gi, idx)
+                self.tracesChanged.emit()
+                self.update()
+            return
+        self.selected = nearest
+        self._dragging = bool(nearest)
+        self.update()
+
+    def mouseMoveEvent(self, event):
+        if not self.editing or not self._dragging or not self.selected:
+            return super().mouseMoveEvent(event)
+        img_point = self._widget_to_image(event.pos())
+        if img_point is None:
+            return
+        gi, pi = self.selected
+        self.traces[gi]["outline_polygon"][pi] = img_point
+        self.tracesChanged.emit()
+        self.update()
+
+    def mouseReleaseEvent(self, event):
+        self._dragging = False
+        super().mouseReleaseEvent(event)
+
+class GlyphTraceEditorDialog(QDialog):
+    def __init__(self, image_path, glyph_rows, overlay_path="", parent=None):
+        super().__init__(parent)
+        self.image_path = image_path
+        self.glyph_rows = glyph_rows
+        self.overlay_path = overlay_path
+        self.traces = self._load_traces()
+        self.setWindowTitle("AI Glyph Border Trace")
+        self.resize(1000, 760)
+        layout = QVBoxLayout(self)
+
+        tool_row = QHBoxLayout()
+        self.edit_btn = QPushButton("Edit")
+        self.save_btn = QPushButton("Save")
+        self.save_btn.setEnabled(False)
+        self.mode_group = QButtonGroup(self)
+        self.move_btn = QPushButton("Move")
+        self.add_btn = QPushButton("Add Anchor")
+        self.remove_btn = QPushButton("Remove Anchor")
+        for btn in (self.move_btn, self.add_btn, self.remove_btn):
+            btn.setCheckable(True)
+            self.mode_group.addButton(btn)
+            btn.setEnabled(False)
+        self.move_btn.setChecked(True)
+        tool_row.addWidget(self.edit_btn)
+        tool_row.addWidget(self.save_btn)
+        tool_row.addSpacing(12)
+        tool_row.addWidget(self.move_btn)
+        tool_row.addWidget(self.add_btn)
+        tool_row.addWidget(self.remove_btn)
+        tool_row.addStretch()
+        layout.addLayout(tool_row)
+
+        self.canvas = GlyphTraceCanvas(image_path, self.traces, self)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(self.canvas)
+        layout.addWidget(scroll, 1)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        layout.addWidget(close_btn, alignment=Qt.AlignmentFlag.AlignRight)
+
+        self.edit_btn.clicked.connect(self._toggle_edit)
+        self.save_btn.clicked.connect(self.save_changes)
+        self.move_btn.clicked.connect(lambda: self.canvas.set_mode("move"))
+        self.add_btn.clicked.connect(lambda: self.canvas.set_mode("add"))
+        self.remove_btn.clicked.connect(lambda: self.canvas.set_mode("remove"))
+        self.canvas.tracesChanged.connect(lambda: self.save_btn.setEnabled(True))
+
+    def _load_traces(self):
+        traces = []
+        for row in self.glyph_rows:
+            data_path = row.get("glyph_data_path", "")
+            data = {}
+            if data_path and os.path.exists(data_path):
+                try:
+                    with open(data_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                except Exception:
+                    data = {}
+            geom = data.get("geometric_data", {}) if isinstance(data, dict) else {}
+            traces.append({
+                "id": row.get("id"),
+                "glyph_data_path": data_path,
+                "glyph_image_path": row.get("glyph_image_path", ""),
+                "bbox": data.get("bbox", row.get("bbox", [])) if isinstance(data, dict) else row.get("bbox", []),
+                "outline_polygon": geom.get("outline_polygon", []),
+                "triangle_mesh": geom.get("triangle_mesh", []),
+            })
+        return traces
+
+    def _toggle_edit(self):
+        enabled = not self.canvas.editing
+        self.canvas.set_editing(enabled)
+        self.edit_btn.setText("Editing" if enabled else "Edit")
+        for btn in (self.move_btn, self.add_btn, self.remove_btn):
+            btn.setEnabled(enabled)
+
+    def save_changes(self):
+        for trace in self.traces:
+            data_path = trace.get("glyph_data_path", "")
+            if not data_path:
+                continue
+            try:
+                trace["triangle_mesh"] = self._fan_triangles(trace.get("outline_polygon", []))
+                data = {}
+                if os.path.exists(data_path):
+                    with open(data_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                data.setdefault("geometric_data", {})
+                data["geometric_data"]["outline_polygon"] = trace.get("outline_polygon", [])
+                data["geometric_data"]["triangle_mesh"] = trace.get("triangle_mesh", [])
+                bbox = self._bbox_from_polygon(trace.get("outline_polygon", []))
+                if bbox:
+                    data["bbox"] = bbox
+                    run_ai_query("UPDATE ai_glyphs SET bbox=? WHERE id=?", (json.dumps(bbox), trace.get("id")))
+                with open(data_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+            except Exception:
+                pass
+        if self.overlay_path:
+            render_glyph_trace_overlay(self.image_path, self.traces, self.overlay_path)
+        self.save_btn.setEnabled(False)
+        QMessageBox.information(self, "Trace Saved", "Edited glyph border anchors were saved.")
+
+    def _fan_triangles(self, polygon):
+        if len(polygon) < 3:
+            return []
+        cx = int(round(sum(int(p[0]) for p in polygon) / len(polygon)))
+        cy = int(round(sum(int(p[1]) for p in polygon) / len(polygon)))
+        center = [cx, cy]
+        return [[center, polygon[i], polygon[(i + 1) % len(polygon)]] for i in range(len(polygon))]
+
+    def _bbox_from_polygon(self, polygon):
+        if not polygon:
+            return []
+        xs = [int(p[0]) for p in polygon]
+        ys = [int(p[1]) for p in polygon]
+        return [min(xs), min(ys), max(xs) - min(xs) + 1, max(ys) - min(ys) + 1]
+
 class AIDatabasePage(QWidget):
     def __init__(self):
         super().__init__()
@@ -2868,7 +3321,7 @@ class AIDatabasePage(QWidget):
         self.table.setColumnCount(16)
         self.table.setHorizontalHeaderLabels([
             "Area", "ID", "Artifact Name", "Model Used", "Confidence Score",
-            "Glyphs", "Area px", "Complexity", "Junctions", "Endpoints", "Branches",
+            "Glyphs", "Area px", "Complexity", "Vertices", "Triangles", "Edges",
             "Transcription", "Translation", "Notes", "Writing System", "Actions"
         ])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
@@ -2945,8 +3398,8 @@ class AIDatabasePage(QWidget):
             if icon_source and os.path.exists(icon_source):
                 area_btn.setIcon(QIcon(icon_source))
                 area_btn.setIconSize(QSize(26, 22))
-                area_btn.setToolTip(f"Show AI analysed text areas:\n{view_path}")
-                area_btn.clicked.connect(lambda checked, p=view_path: self.view_analyzed_area(p))
+                area_btn.setToolTip(f"Show/edit AI glyph border trace:\n{view_path}")
+                area_btn.clicked.connect(lambda checked, r=row, p=overlay_path: self.view_analyzed_area(r, p))
             else:
                 area_btn.setText("□")
                 area_btn.setToolTip("No analysed-area overlay was found for this record")
@@ -2978,9 +3431,49 @@ class AIDatabasePage(QWidget):
             return
         if not open_file_with_system_app(path):
             QMessageBox.warning(self, "Open PDF", f"Could not open PDF viewer for:\n{path}")
-    def view_analyzed_area(self, path):
-        if not path or not os.path.exists(path):
+    def _glyph_trace_rows_for_record(self, row):
+        image_path = row[9] if len(row) > 9 else ""
+        artifact = row[1] if len(row) > 1 else ""
+        rows = []
+        if image_path:
+            rows = run_ai_query(
+                "SELECT id, glyph_image_path, glyph_data_path, glyph_index, bbox FROM ai_glyphs "
+                "WHERE source_image_path=? ORDER BY glyph_index ASC, id ASC",
+                (image_path,), fetch=True
+            )
+        if not rows and artifact:
+            rows = run_ai_query(
+                "SELECT id, glyph_image_path, glyph_data_path, glyph_index, bbox FROM ai_glyphs "
+                "WHERE artifact_name=? ORDER BY glyph_index ASC, id ASC",
+                (artifact,), fetch=True
+            )
+        result = []
+        for gid, glyph_img, data_path, glyph_index, bbox in rows:
+            try:
+                bbox_val = json.loads(bbox) if bbox else []
+            except Exception:
+                bbox_val = []
+            result.append({
+                "id": gid,
+                "glyph_image_path": glyph_img or "",
+                "glyph_data_path": data_path or "",
+                "glyph_index": glyph_index,
+                "bbox": bbox_val,
+            })
+        return result
+
+    def view_analyzed_area(self, row, overlay_path):
+        image_path = row[9] if len(row) > 9 else ""
+        if not image_path or not os.path.exists(image_path):
+            image_path = overlay_path
+        if not image_path or not os.path.exists(image_path):
             QMessageBox.warning(self, "Image Missing", "The analysed-area image could not be found.")
+            return
+        glyph_rows = self._glyph_trace_rows_for_record(row)
+        if glyph_rows:
+            dlg = GlyphTraceEditorDialog(image_path, glyph_rows, overlay_path, self)
+            dlg.exec()
+            self.load_data()
             return
         dlg = QDialog(self)
         dlg.setWindowTitle("AI Analysed Text Areas")
@@ -2988,7 +3481,8 @@ class AIDatabasePage(QWidget):
         layout = QVBoxLayout(dlg)
         lbl = QLabel()
         lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        pix = QPixmap(path)
+        pix_path = overlay_path if overlay_path and os.path.exists(overlay_path) else image_path
+        pix = QPixmap(pix_path)
         if not pix.isNull():
             lbl.setPixmap(pix)
         else:
@@ -3237,6 +3731,11 @@ class GeometricAnalysisPage(QWidget):
             "area": glyph.get("area", ""),
             "aspect_ratio": glyph.get("aspect_ratio", ""),
             "solidity": glyph.get("solidity", ""),
+            "geometric_data": {
+                "outline_polygon": glyph.get("outline_polygon", []),
+                "triangle_mesh": glyph.get("triangle_mesh", []),
+                "shape_signature": glyph.get("geometric_signature", {}),
+            },
             "glyph_name": glyph_name,
             "modern_equivalent": modern_equiv,
             "notes": notes,
@@ -4298,22 +4797,22 @@ class BarChartWidget(QWidget):
 # ═══════════════════════════════════════════════════════════════════════════════
 #
 # Pipeline:
-#   [Raw Image/3D Scan] 
-#     → (Phase 1: CV Layer — denoise, threshold, segment, inpaint, clean)
-#     → [Perfect Vector Skeleton]
-#     → (Phase 2: Geometric Layer — skeletonize, graph theory, Procrustes, Hausdorff)
-#     → [Scientific Analysis Report]
+#   [Raw Image/3D Scan]
+#     -> (Phase 1: CV Layer - denoise, threshold, segment, clean)
+#     -> [Glyph Boundary Polygons]
+#     -> (Phase 2: Geometric Layer - polygon outline, triangle mesh, shape signature)
+#     -> [Scientific Analysis Report]
 #
 
 class ScientificGlyphAnalyzer:
     """Pure scientific analysis of ancient glyphs using deterministic math.
-    
+
     Phase 1 (AI/CV Layer): OpenCV-based cleaning, segmentation, and extraction.
-    Phase 2 (Geometric Layer): Medial axis skeletonization + graph theory + Procrustes.
+    Phase 2 (Geometric Layer): boundary polygon + triangle mesh measurement.
     """
     
     def __init__(self):
-        self._last_skeleton = None
+        self._last_polygon_overlay = None
         self._last_contours = None
         self._last_glyph_graphs = []
         self._last_report = {}
@@ -4342,20 +4841,31 @@ class ScientificGlyphAnalyzer:
             "segmentation_count": 0
         }
         
-        # Step 1: Convert to grayscale
+        # Step 1: Convert to grayscale and contrast spaces
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        l_chan, a_chan, b_chan = cv2.split(lab)
         
         # Step 2: CLAHE (Contrast Limited Adaptive Histogram Equalization)
         # This handles inconsistent lighting like shadows on stone tablets
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(gray)
+        enhanced = clahe.apply(l_chan)
         
-        # Step 3: Adaptive thresholding (OTSU fallback)
-        # Adaptive threshold handles varying background intensity
-        binary = cv2.adaptiveThreshold(
+        # Step 3: Color/luminance contrast thresholding for tighter glyph borders.
+        # The adaptive mask handles shadows, the Otsu mask catches strong ink/stone
+        # contrast, and the chroma mask preserves colored glyph marks.
+        adaptive_mask = cv2.adaptiveThreshold(
             enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY_INV, 11, 2
         )
+        _, otsu_mask = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        chroma_delta = cv2.addWeighted(
+            cv2.absdiff(a_chan, int(np.median(a_chan))), 0.5,
+            cv2.absdiff(b_chan, int(np.median(b_chan))), 0.5,
+            0
+        )
+        _, chroma_mask = cv2.threshold(chroma_delta, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        binary = cv2.bitwise_or(cv2.bitwise_and(adaptive_mask, otsu_mask), chroma_mask)
         
         # Step 4: Morphological operations to heal broken strokes
         # Closing: dilate then erode — connects broken parts of characters
@@ -4404,6 +4914,11 @@ class ScientificGlyphAnalyzer:
             hull_area = cv2.contourArea(hull)
             solidity = float(area) / max(hull_area, 1) if hull_area > 0 else 0
             
+            local_cnt = cnt.copy()
+            local_cnt[:, 0, 0] -= x
+            local_cnt[:, 0, 1] -= y
+            polygon_model = self._polygonize_glyph(glyph_mask, local_cnt)
+
             valid_glyphs.append({
                 "index": len(valid_glyphs),
                 "bbox": (int(x), int(y), int(w), int(h)),
@@ -4414,7 +4929,10 @@ class ScientificGlyphAnalyzer:
                 "contour_points": cnt,
                 "mask": glyph_mask,
                 "gray": glyph_gray,
-                "contour_simplified": cv2.approxPolyDP(cnt, 0.02 * cv2.arcLength(cnt, True), True)
+                "contour_simplified": cv2.approxPolyDP(cnt, 0.02 * cv2.arcLength(cnt, True), True),
+                "outline_polygon": polygon_model.get("outline_polygon", []),
+                "triangle_mesh": polygon_model.get("triangles", []),
+                "geometric_signature": polygon_model.get("signature", {}),
             })
         
         result["glyphs"] = valid_glyphs
@@ -4437,55 +4955,60 @@ class ScientificGlyphAnalyzer:
     # ── Phase 2: Geometric Layer (Scientific Measurement) ─────────────────
     
     def phase2_geometric_analysis(self, phase1_result):
-        """Phase 2: Deterministic geometric analysis of extracted glyphs.
-        
-        Steps:
-        1. Medial Axis Transform (skeletonization) for each glyph
-        2. Graph theory: nodes at crossings/endpoints, edges as strokes
-        3. Branch counting, angle measurement, junction detection
-        4. Procrustes alignment for shape comparison
-        5. Hausdorff distance metrics
-        
-        Returns dict with structural metrics per glyph and overall statistics.
+        """Convert every glyph boundary into calculable polygon data.
+
+        The analyzer now follows a face-detection-style landmark model, but for
+        text: it detects the glyph boundary, simplifies it into a polygon, fills
+        that boundary with triangles, and records the triangle/outline signature.
+        This avoids relying on stroke centerline depth, curvature, or branch tracing.
         """
         analysis = {
             "glyph_metrics": [],
             "overall_report": {},
-            "skeletons_visual": None,
-            "graph_visual": None
+            "polygon_visual": None,
+            "mesh_visual": None
         }
         
         glyphs = phase1_result.get("glyphs", [])
         if not glyphs:
             return analysis
         
-        all_graphs = []
-        combined_skeleton = None
         h, w = phase1_result["original_shape"][:2]
+        mesh_visual = np.zeros((h, w, 3), dtype=np.uint8)
+        source_visual = phase1_result.get("visualization")
+        if source_visual is None:
+            source_visual = np.zeros((h, w, 3), dtype=np.uint8)
+        polygon_overlay = source_visual.copy()
         
         for glyph in glyphs:
             mask = glyph["mask"]
-            
-            # Step 1: Medial Axis Transform (skeletonization)
-            # This creates a 1-pixel-wide skeleton capturing the "movement of the scribe's hand"
-            skeleton = medial_axis(mask > 0)
-            skeleton_uint8 = (skeleton * 255).astype(np.uint8)
-            
-            # Step 2: Skeleton pruning (remove single-pixel branches from noise)
-            pruned = self._prune_skeleton(skeleton_uint8, min_branch_length=3)
-            
-            # Step 3: Detect junction points and endpoints
-            junctions, endpoints, branch_points = self._analyze_skeleton_topology(pruned)
-            
-            # Step 4: Compute stroke angles from junction graph
-            stroke_angles, stroke_lengths = self._compute_stroke_angles(pruned, junctions, endpoints)
-            
-            # Step 5: Build geometric graph representation
-            graph = self._build_glyph_graph(junctions, endpoints, branch_points, 
-                                           glyph["bbox"], stroke_angles, stroke_lengths)
-            all_graphs.append(graph)
-            
-            # Step 6: Compute structural metrics
+            polygon_model = self._polygonize_glyph(mask)
+            outline = polygon_model.get("outline_polygon", [])
+            triangles = polygon_model.get("triangles", [])
+            signature = polygon_model.get("signature", {})
+            x, y, _, _ = glyph["bbox"]
+
+            abs_outline = [[int(px + x), int(py + y)] for px, py in outline]
+            abs_triangles = [
+                [[int(px + x), int(py + y)] for px, py in tri]
+                for tri in triangles
+            ]
+
+            triangle_areas = [t.get("area", 0.0) for t in polygon_model.get("triangle_metrics", [])]
+            triangle_angles = []
+            for t in polygon_model.get("triangle_metrics", []):
+                triangle_angles.extend(t.get("angles_deg", []))
+
+            for tri in abs_triangles:
+                pts = np.array(tri, dtype=np.int32)
+                cv2.polylines(mesh_visual, [pts], True, (55, 180, 255), 1, cv2.LINE_AA)
+                cv2.polylines(polygon_overlay, [pts], True, (0, 170, 255), 1, cv2.LINE_AA)
+            if abs_outline:
+                pts = np.array(abs_outline, dtype=np.int32)
+                cv2.polylines(polygon_overlay, [pts], True, (255, 255, 255), 2, cv2.LINE_AA)
+                for px, py in abs_outline:
+                    cv2.circle(polygon_overlay, (px, py), 2, (0, 255, 255), -1, cv2.LINE_AA)
+
             metrics = {
                 "glyph_index": glyph["index"],
                 "bounding_box": glyph["bbox"],
@@ -4493,266 +5016,192 @@ class ScientificGlyphAnalyzer:
                 "area": glyph["area"],
                 "aspect_ratio": glyph["aspect_ratio"],
                 "solidity": glyph["solidity"],
-                
-                # Skeleton metrics
-                "skeleton_pixels": int(np.sum(pruned > 0)),
-                "junction_count": len(junctions),
-                "endpoint_count": len(endpoints),
-                "branch_count": len(stroke_lengths),
-                "avg_stroke_length": float(np.mean(stroke_lengths)) if stroke_lengths else 0,
-                "std_stroke_length": float(np.std(stroke_lengths)) if len(stroke_lengths) > 1 else 0,
-                
-                # Angle metrics
-                "stroke_angles_deg": [float(f"{a:.1f}") for a in stroke_angles],
-                "stroke_lengths_px": [float(f"{l:.1f}") for l in stroke_lengths],
-                
-                # Derived metrics
-                "complexity_score": float(f"{self._compute_complexity(glyph, junctions, stroke_lengths):.3f}"),
+                "polygon_vertices": len(outline),
+                "polygon_edges": len(outline),
+                "polygon_area": signature.get("polygon_area", 0.0),
+                "polygon_perimeter": signature.get("polygon_perimeter", 0.0),
+                "convex_hull_area": signature.get("convex_hull_area", 0.0),
+                "convexity_ratio": signature.get("convexity_ratio", 0.0),
+                "hole_count": signature.get("hole_count", 0),
+                "triangle_count": len(triangles),
+                "outline_polygon": abs_outline,
+                "triangle_mesh": abs_triangles,
+                "triangle_areas_px": [float(f"{a:.2f}") for a in triangle_areas],
+                "avg_triangle_area": float(f"{np.mean(triangle_areas):.3f}") if triangle_areas else 0,
+                "std_triangle_area": float(f"{np.std(triangle_areas):.3f}") if len(triangle_areas) > 1 else 0,
+                "triangle_angles_deg": [float(f"{a:.1f}") for a in triangle_angles],
+                "shape_vector": signature.get("shape_vector", []),
+                "complexity_score": float(f"{self._compute_polygon_complexity(signature, len(triangles)):.3f}"),
                 "elongation": float(f"{self._compute_elongation(mask):.3f}"),
                 "compactness": float(f"{self._compute_compactness(mask):.3f}"),
             }
             analysis["glyph_metrics"].append(metrics)
-        
-        # Build combined skeleton visualization
-        combined = np.zeros((h, w), dtype=np.uint8)
-        for glyph in glyphs:
-            x, y, w_g, h_g = glyph["bbox"]
-            sk = medial_axis(glyph["mask"] > 0).astype(np.uint8) * 255
-            if sk.shape[0] <= h_g and sk.shape[1] <= w_g:
-                combined[y:y+sk.shape[0], x:x+sk.shape[1]] = np.maximum(
-                    combined[y:y+sk.shape[0], x:x+sk.shape[1]], sk)
-        
-        # Color skeleton overlay on original
-        orig = cv2.imread(glyphs[0].get("_source_path", "")) if "gray" in glyphs[0] else None
-        if orig is None:
-            # Create a blank canvas with bounding boxes
-            orig_vis = np.zeros((h, w, 3), dtype=np.uint8)
-            for g in glyphs:
-                x, y, w_b, h_b = g["bbox"]
-                cv2.rectangle(orig_vis, (x, y), (x + w_b, y + h_b), (40, 40, 40), 1)
-        else:
-            orig_vis = orig.copy()
-        
-        # Overlay skeleton in cyan
-        sk_colored = np.stack([combined * 0, combined * 255, combined * 255], axis=2)
-        skeleton_overlay = cv2.addWeighted(orig_vis, 0.7, sk_colored, 0.8, 0)
-        
-        # Draw junction points in red
-        for glyph_metrics, glyph_obj in zip(analysis["glyph_metrics"], glyphs):
-            # Recompute junctions for drawing
-            x, y, w_g, h_g = glyph_obj["bbox"]
-            sk = medial_axis(glyph_obj["mask"] > 0).astype(np.uint8) * 255
-            pruned = self._prune_skeleton(sk, 3)
-            junctions, endpoints, _ = self._analyze_skeleton_topology(pruned)
-            
-            for jx, jy in junctions:
-                abs_x, abs_y = x + jx, y + jy
-                cv2.circle(skeleton_overlay, (abs_x, abs_y), 3, (0, 0, 255), -1)
-            for ex, ey in endpoints:
-                abs_x, abs_y = x + ex, y + ey
-                cv2.circle(skeleton_overlay, (abs_x, abs_y), 2, (255, 0, 255), -1)
-        
-        analysis["skeletons_visual"] = skeleton_overlay
-        analysis["combined_skeleton"] = combined
-        self._last_skeleton = combined
-        self._last_glyph_graphs = all_graphs
+
+        analysis["polygon_visual"] = polygon_overlay
+        analysis["mesh_visual"] = mesh_visual
+        self._last_polygon_overlay = polygon_overlay
+        self._last_glyph_graphs = [m.get("triangle_mesh", []) for m in analysis["glyph_metrics"]]
         
         # Generate overall report
         analysis["overall_report"] = self._generate_overall_report(analysis)
         self._last_report = analysis["overall_report"]
         
         return analysis
-    
-    def _prune_skeleton(self, skeleton, min_branch_length=3):
-        """Prune small branches from skeleton to remove noise artifacts."""
-        if np.sum(skeleton) == 0:
-            return skeleton
-        
-        pruned = skeleton.copy()
-        h, w = skeleton.shape
-        
-        # Iteratively remove short branches
-        changed = True
-        while changed:
-            changed = False
-            kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
-            
-            # Find endpoints (pixels with exactly 1 neighbor)
-            neighbor_count = cv2.filter2D(
-                (pruned > 0).astype(np.uint8), -1, kernel
-            )
-            neighbor_count[pruned == 0] = 0
-            endpoints_map = (neighbor_count == 2) & (pruned > 0)  # cross kernel sum=2 for one neighbor
-            
-            # Trace from each endpoint
-            ys, xs = np.where(endpoints_map)
-            for ex, ey in zip(xs, ys):
-                branch_length = 0
-                cx, cy = ex, ey
-                visited = set()
-                while True:
-                    if (cx, cy) in visited or cy >= h or cx >= w:
-                        break
-                    visited.add((cx, cy))
-                    # Check neighbors
-                    y1, y2 = max(0, cy-1), min(h-1, cy+1)
-                    x1, x2 = max(0, cx-1), min(w-1, cx+1)
-                    neighbors = []
-                    for ny in range(y1, y2+1):
-                        for nx in range(x1, x2+1):
-                            if (nx, ny) not in visited and pruned[ny, nx] > 0:
-                                neighbors.append((nx, ny))
-                    if len(neighbors) == 1:
-                        cx, cy = neighbors[0]
-                        branch_length += 1
-                    else:
-                        break
-                
-                if branch_length < min_branch_length and branch_length > 0:
-                    # Remove this branch
-                    for px, py in visited:
-                        if 0 <= py < h and 0 <= px < w:
-                            pruned[py, px] = 0
-                    changed = True
-        
-        return pruned
-    
-    def _analyze_skeleton_topology(self, skeleton):
-        """Find junction points (≥3 neighbors) and endpoints (1 neighbor) in skeleton."""
-        if np.sum(skeleton) == 0:
-            return [], [], []
-        
-        h, w = skeleton.shape
-        kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
-        neighbor_count = cv2.filter2D(
-            (skeleton > 0).astype(np.uint8), -1, kernel
-        )
-        neighbor_count[skeleton == 0] = 0
-        
-        # Endpoints have exactly 1 neighbor (sum=2 with cross kernel)
-        endpoints = np.where((neighbor_count == 2) & (skeleton > 0))
-        
-        # Junction points have 3+ neighbors (sum >= 4 with cross kernel)
-        junctions = np.where((neighbor_count >= 4) & (skeleton > 0))
-        
-        # Branch points (2 neighbors = regular path pixel)
-        branch_points = np.where((neighbor_count == 3) & (skeleton > 0))
-        
-        junction_list = list(zip(junctions[1], junctions[0]))  # (x, y)
-        endpoint_list = list(zip(endpoints[1], endpoints[0]))
-        branch_list = list(zip(branch_points[1], branch_points[0]))
-        
-        # Cluster nearby junctions (merge if within 2 pixels)
-        merged_junctions = []
-        for jx, jy in junction_list:
-            found = False
-            for mi, (mx, my) in enumerate(merged_junctions):
-                if abs(jx - mx) <= 2 and abs(jy - my) <= 2:
-                    merged_junctions[mi] = ((mx + jx) // 2, (my + jy) // 2)
-                    found = True
-                    break
-            if not found:
-                merged_junctions.append((jx, jy))
-        
-        return merged_junctions, endpoint_list, branch_list
-    
-    def _compute_stroke_angles(self, skeleton, junctions, endpoints):
-        """Compute angles and lengths of strokes between junction points."""
-        stroke_angles = []
-        stroke_lengths = []
-        
-        all_points = junctions + endpoints
-        if len(all_points) < 2:
-            return stroke_angles, stroke_lengths
-        
-        # For each pair of junction/endpoint points, trace the path
-        for i, (x1, y1) in enumerate(all_points):
-            for j, (x2, y2) in enumerate(all_points):
-                if j <= i:
-                    continue
-                # Check if there's a direct skeleton path
-                # Simple heuristic: line between points should have significant overlap with skeleton
-                dy = y2 - y1
-                dx = x2 - x1
-                dist = math.sqrt(dx*dx + dy*dy)
-                if dist < 5:
-                    continue
-                
-                # Sample points along the line
-                num_samples = max(2, int(dist / 2))
-                overlap = 0
-                for s in range(num_samples + 1):
-                    t = s / num_samples
-                    px = int(x1 + t * dx)
-                    py = int(y1 + t * dy)
-                    h, w = skeleton.shape[:2] if skeleton.ndim == 2 else skeleton.shape[:2]
-                    if 0 <= py < h and 0 <= px < w and skeleton[py, px] > 0:
-                        overlap += 1
-                
-                overlap_ratio = overlap / (num_samples + 1)
-                if overlap_ratio > 0.4:  # Significant path overlap
-                    angle = math.degrees(math.atan2(dy, dx))
-                    stroke_angles.append(angle)
-                    stroke_lengths.append(dist)
-        
-        return stroke_angles, stroke_lengths
-    
-    def _build_glyph_graph(self, junctions, endpoints, branch_points, bbox, angles, lengths):
-        """Build a graph representation of the glyph skeleton.
-        
-        Graph nodes = junction points and endpoints (coordinates)
-        Graph edges = strokes connecting nodes (with angle and length attributes)
-        """
-        graph = {
-            "nodes": [],
-            "edges": [],
-            "node_count": len(junctions) + len(endpoints),
-            "edge_count": len(angles)
+
+    def _polygonize_glyph(self, mask, contour=None):
+        """Build a boundary polygon and triangle mesh for a glyph mask."""
+        if mask is None or not isinstance(mask, np.ndarray) or mask.size == 0:
+            return {"outline_polygon": [], "triangles": [], "triangle_metrics": [], "signature": {}}
+
+        binary = (mask > 0).astype(np.uint8) * 255
+        h, w = binary.shape[:2]
+        if contour is None:
+            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                return {"outline_polygon": [], "triangles": [], "triangle_metrics": [], "signature": {}}
+            contour = max(contours, key=cv2.contourArea)
+
+        perimeter = cv2.arcLength(contour, True)
+        epsilon = max(1.0, 0.018 * perimeter)
+        polygon = cv2.approxPolyDP(contour, epsilon, True).reshape(-1, 2)
+        if len(polygon) < 3:
+            polygon = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.int32)
+
+        polygon = self._dedupe_points([[int(x), int(y)] for x, y in polygon])
+        config = CURRENT_SETTINGS.get("pipeline_config", {}) if isinstance(CURRENT_SETTINGS, dict) else {}
+        sample_limit = int(config.get("polygon_sample_points", 36) or 36)
+        sample_points = self._sample_polygon_points(polygon, max_points=max(6, sample_limit))
+        m = cv2.moments(binary)
+        if m["m00"]:
+            centroid = [int(m["m10"] / m["m00"]), int(m["m01"] / m["m00"])]
+        else:
+            centroid = [w // 2, h // 2]
+        points = self._dedupe_points(polygon + sample_points + [centroid])
+
+        triangles = self._triangulate_points(points, binary)
+        triangle_metrics = [self._triangle_metrics(tri) for tri in triangles]
+        signature = self._build_polygon_signature(binary, polygon, triangle_metrics)
+        return {
+            "outline_polygon": polygon,
+            "triangles": triangles,
+            "triangle_metrics": triangle_metrics,
+            "signature": signature,
         }
-        
-        # Add junction nodes
-        for i, (x, y) in enumerate(junctions):
-            graph["nodes"].append({
-                "id": f"J{i}",
-                "type": "junction",
-                "x": int(x),
-                "y": int(y),
-                "relative_x": int(x),  # Relative to glyph bbox
-                "relative_y": int(y)
-            })
-        
-        # Add endpoint nodes
-        for i, (x, y) in enumerate(endpoints):
-            graph["nodes"].append({
-                "id": f"E{i}",
-                "type": "endpoint",
-                "x": int(x),
-                "y": int(y),
-                "relative_x": int(x),
-                "relative_y": int(y)
-            })
-        
-        # Build edges from the angle/length data
-        # This pairs nodes that have direct connections
-        if angles and lengths:
-            for i, (angle, length) in enumerate(zip(angles, lengths)):
-                graph["edges"].append({
-                    "id": i,
-                    "angle_deg": float(f"{angle:.1f}"),
-                    "length_px": float(f"{length:.1f}"),
-                    "normalized_length": float(f"{length / max(lengths, default=1):.3f}"),
-                    "source_node": None,  # Would need full path tracing
-                    "target_node": None
-                })
-        
-        return graph
-    
-    def _compute_complexity(self, glyph, junctions, stroke_lengths):
-        """Compute a complexity score for the glyph based on topology."""
-        junction_score = len(junctions) * 0.3
-        branch_score = len(stroke_lengths) * 0.2
-        area_score = math.log(max(glyph["area"], 1)) * 0.1
-        return min(10.0, junction_score + branch_score + area_score)
+
+    def _dedupe_points(self, points):
+        seen = set()
+        unique = []
+        for x, y in points:
+            key = (int(round(x)), int(round(y)))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append([key[0], key[1]])
+        return unique
+
+    def _sample_polygon_points(self, polygon, max_points=36):
+        if len(polygon) < 2:
+            return []
+        samples = []
+        per_edge = max(1, max_points // max(len(polygon), 1))
+        for i, p1 in enumerate(polygon):
+            p2 = polygon[(i + 1) % len(polygon)]
+            for step in range(1, per_edge + 1):
+                t = step / (per_edge + 1)
+                x = p1[0] + (p2[0] - p1[0]) * t
+                y = p1[1] + (p2[1] - p1[1]) * t
+                samples.append([int(round(x)), int(round(y))])
+        return samples[:max_points]
+
+    def _triangulate_points(self, points, mask):
+        h, w = mask.shape[:2]
+        if w < 2 or h < 2 or len(points) < 3:
+            return []
+        subdiv = cv2.Subdiv2D((0, 0, int(w), int(h)))
+        for x, y in points:
+            px = min(max(float(x), 0.0), float(w - 1))
+            py = min(max(float(y), 0.0), float(h - 1))
+            try:
+                subdiv.insert((px, py))
+            except cv2.error:
+                pass
+        raw = subdiv.getTriangleList()
+        triangles = []
+        for item in raw:
+            tri = [[int(round(item[0])), int(round(item[1]))],
+                   [int(round(item[2])), int(round(item[3]))],
+                   [int(round(item[4])), int(round(item[5]))]]
+            if not all(0 <= x < w and 0 <= y < h for x, y in tri):
+                continue
+            cx = int(round(sum(p[0] for p in tri) / 3))
+            cy = int(round(sum(p[1] for p in tri) / 3))
+            if not (0 <= cx < w and 0 <= cy < h and mask[cy, cx] > 0):
+                continue
+            if cv2.contourArea(np.array(tri, dtype=np.float32)) < 1.0:
+                continue
+            triangles.append(tri)
+        return triangles
+
+    def _triangle_metrics(self, tri):
+        pts = np.array(tri, dtype=np.float32)
+        area = abs(cv2.contourArea(pts))
+        sides = []
+        for i in range(3):
+            p1 = pts[i]
+            p2 = pts[(i + 1) % 3]
+            sides.append(float(np.linalg.norm(p2 - p1)))
+        angles = []
+        for i in range(3):
+            a = sides[i - 1]
+            b = sides[i]
+            c = sides[(i + 1) % 3]
+            denom = max(2 * a * b, 1e-6)
+            val = max(-1.0, min(1.0, (a * a + b * b - c * c) / denom))
+            angles.append(float(f"{math.degrees(math.acos(val)):.2f}"))
+        return {
+            "area": float(f"{area:.3f}"),
+            "side_lengths": [float(f"{s:.3f}") for s in sides],
+            "angles_deg": angles,
+        }
+
+    def _build_polygon_signature(self, mask, polygon, triangle_metrics):
+        poly_np = np.array(polygon, dtype=np.float32)
+        polygon_area = abs(cv2.contourArea(poly_np)) if len(poly_np) >= 3 else 0.0
+        perimeter = cv2.arcLength(poly_np.astype(np.int32), True) if len(poly_np) >= 3 else 0.0
+        hull = cv2.convexHull(poly_np.astype(np.int32)) if len(poly_np) >= 3 else np.array([])
+        hull_area = abs(cv2.contourArea(hull)) if len(hull) >= 3 else 0.0
+        contours, hierarchy = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        hole_count = 0
+        if hierarchy is not None:
+            hole_count = sum(1 for item in hierarchy[0] if item[3] >= 0)
+        tri_areas = [t.get("area", 0.0) for t in triangle_metrics]
+        fill_area = float(np.sum(mask > 0))
+        vector = [
+            len(polygon),
+            polygon_area / max(fill_area, 1.0),
+            perimeter / max(math.sqrt(fill_area), 1.0),
+            hull_area / max(fill_area, 1.0),
+            float(np.mean(tri_areas)) / max(fill_area, 1.0) if tri_areas else 0.0,
+            float(np.std(tri_areas)) / max(fill_area, 1.0) if len(tri_areas) > 1 else 0.0,
+            hole_count,
+        ]
+        return {
+            "polygon_area": float(f"{polygon_area:.3f}"),
+            "mask_area": float(f"{fill_area:.3f}"),
+            "polygon_perimeter": float(f"{perimeter:.3f}"),
+            "convex_hull_area": float(f"{hull_area:.3f}"),
+            "convexity_ratio": float(f"{(polygon_area / max(hull_area, 1.0)):.4f}"),
+            "hole_count": int(hole_count),
+            "shape_vector": [float(f"{v:.5f}") for v in vector],
+        }
+
+    def _compute_polygon_complexity(self, signature, triangle_count):
+        vertex_score = min(4.0, signature.get("shape_vector", [0])[0] * 0.18)
+        mesh_score = min(3.0, triangle_count * 0.08)
+        hole_score = min(1.5, signature.get("hole_count", 0) * 0.75)
+        convexity = signature.get("convexity_ratio", 1.0)
+        concavity_score = max(0.0, 1.0 - convexity) * 2.0
+        return min(10.0, vertex_score + mesh_score + hole_score + concavity_score)
     
     def _compute_elongation(self, mask):
         """Compute elongation: 1 - (width/height) normalized."""
@@ -4783,10 +5232,10 @@ class ScientificGlyphAnalyzer:
             return {"error": "No glyphs detected for analysis"}
         
         report = {
-            "phase": "Scientific Glyph Analysis Complete",
+            "phase": "Geometric Polygon Glyph Analysis Complete",
             "pipeline": [
-                "Phase 1: CV Layer — Adaptive thresholding → Morphological clean → Connected component segmentation",
-                "Phase 2: Geometric Layer — Medial Axis Skeletonization → Graph Theory → Topological Analysis"
+                "Phase 1: CV Layer - Adaptive thresholding -> Morphological clean -> Connected component segmentation",
+                "Phase 2: Geometric Layer - Boundary polygon -> Triangle mesh -> Shape vector"
             ],
             "summary": {}
         }
@@ -4796,24 +5245,30 @@ class ScientificGlyphAnalyzer:
         total_area = sum(m["area"] for m in metrics)
         avg_aspect = np.mean([m["aspect_ratio"] for m in metrics])
         avg_solidity = np.mean([m["solidity"] for m in metrics])
-        total_junctions = sum(m["junction_count"] for m in metrics)
-        total_endpoints = sum(m["endpoint_count"] for m in metrics)
-        total_branches = sum(m["branch_count"] for m in metrics)
+        total_vertices = sum(m["polygon_vertices"] for m in metrics)
+        total_triangles = sum(m["triangle_count"] for m in metrics)
+        total_edges = sum(m["polygon_edges"] for m in metrics)
         avg_complexity = np.mean([m["complexity_score"] for m in metrics])
+        avg_triangles = total_triangles / max(glyph_count, 1)
+        avg_convexity = np.mean([m["convexity_ratio"] for m in metrics])
         
         report["summary"] = {
             "glyphs_detected": glyph_count,
             "total_glyph_area_px": int(total_area),
             "avg_aspect_ratio": float(f"{avg_aspect:.3f}"),
             "avg_solidity": float(f"{avg_solidity:.3f}"),
-            "total_junction_points": int(total_junctions),
-            "total_endpoints": int(total_endpoints),
-            "total_stroke_branches": int(total_branches),
+            "total_polygon_vertices": int(total_vertices),
+            "total_triangle_cells": int(total_triangles),
+            "total_polygon_edges": int(total_edges),
+            "avg_triangles_per_glyph": float(f"{avg_triangles:.2f}"),
+            "avg_convexity_ratio": float(f"{avg_convexity:.3f}"),
             "avg_complexity_score": float(f"{avg_complexity:.3f}"),
-            "junction_to_endpoint_ratio": float(
-                f"{(total_junctions / max(total_endpoints, 1)):.3f}"
-            ),
-            "branches_per_glyph": float(f"{(total_branches / max(glyph_count, 1)):.2f}"),
+            # Compatibility fields for older DB columns/UI. They now map to polygon metrics.
+            "total_junction_points": int(total_vertices),
+            "total_endpoints": int(total_triangles),
+            "total_stroke_branches": int(total_edges),
+            "junction_to_endpoint_ratio": float(f"{(total_vertices / max(total_triangles, 1)):.3f}"),
+            "branches_per_glyph": float(f"{(total_edges / max(glyph_count, 1)):.2f}"),
         }
         
         # Per-glyph detailed metrics
@@ -4823,11 +5278,15 @@ class ScientificGlyphAnalyzer:
                 "glyph": m["glyph_index"],
                 "bbox": m["bounding_box"],
                 "structural": {
-                    "skeleton_pixels": m["skeleton_pixels"],
-                    "junctions": m["junction_count"],
-                    "endpoints": m["endpoint_count"],
-                    "branches": m["branch_count"],
-                    "avg_stroke_length": m["avg_stroke_length"],
+                    "polygon_vertices": m["polygon_vertices"],
+                    "polygon_edges": m["polygon_edges"],
+                    "triangle_cells": m["triangle_count"],
+                    "avg_triangle_area": m["avg_triangle_area"],
+                    "convexity_ratio": m["convexity_ratio"],
+                    # Compatibility aliases for old table/report readers.
+                    "junctions": m["polygon_vertices"],
+                    "endpoints": m["triangle_count"],
+                    "branches": m["polygon_edges"],
                 },
                 "morphological": {
                     "area": m["area"],
@@ -4838,8 +5297,11 @@ class ScientificGlyphAnalyzer:
                     "complexity": m["complexity_score"],
                 },
                 "geometry": {
-                    "stroke_angles": m["stroke_angles_deg"],
-                    "stroke_lengths": m["stroke_lengths_px"],
+                    "outline_polygon": m["outline_polygon"],
+                    "triangle_mesh": m["triangle_mesh"],
+                    "triangle_areas": m["triangle_areas_px"],
+                    "triangle_angles": m["triangle_angles_deg"],
+                    "shape_vector": m["shape_vector"],
                 }
             })
         
@@ -4847,54 +5309,37 @@ class ScientificGlyphAnalyzer:
     
     def compute_similarity(self, glyph1_mask, glyph2_mask):
         """Compute deterministic shape similarity between two glyphs.
-        
+
         Uses:
-        - Hausdorff distance (contour deviation)
-        - Procrustes analysis (shape alignment)
-        - Overlap coefficient (structural similarity)
-        
+        - Hausdorff distance on boundary polygons
+        - Procrustes analysis on polygon landmarks
+        - Triangle/polygon shape-vector distance
+
         Returns dict with similarity metrics (0-1 scale, 1 = identical).
         """
         if glyph1_mask is None or glyph2_mask is None:
             return {"error": "Invalid glyph masks"}
-        
-        # Skeletonize both
-        sk1 = medial_axis(glyph1_mask > 0).astype(np.uint8)
-        sk2 = medial_axis(glyph2_mask > 0).astype(np.uint8)
-        
+
+        model1 = self._polygonize_glyph(glyph1_mask)
+        model2 = self._polygonize_glyph(glyph2_mask)
+        poly1 = np.array(model1.get("outline_polygon", []), dtype=np.float32)
+        poly2 = np.array(model2.get("outline_polygon", []), dtype=np.float32)
+
         result = {}
-        
-        # 1. Hausdorff Distance (contour comparison)
-        cnt1_points = np.column_stack(np.where(sk1 > 0))
-        cnt2_points = np.column_stack(np.where(sk2 > 0))
-        
-        if len(cnt1_points) > 0 and len(cnt2_points) > 0:
-            h_dist = directed_hausdorff(cnt1_points, cnt2_points)[0]
-            max_dim = max(glyph1_mask.shape[0], glyph1_mask.shape[1])
+
+        if len(poly1) > 0 and len(poly2) > 0:
+            h_dist = max(directed_hausdorff(poly1, poly2)[0], directed_hausdorff(poly2, poly1)[0])
+            max_dim = max(glyph1_mask.shape[0], glyph1_mask.shape[1], glyph2_mask.shape[0], glyph2_mask.shape[1])
             hausdorff_similarity = max(0, 1 - (h_dist / max_dim))
             result["hausdorff_similarity"] = float(f"{hausdorff_similarity:.4f}")
         else:
             result["hausdorff_similarity"] = 0
-        
-        # 2. Procrustes Analysis (shape alignment)
+
         try:
-            if len(cnt1_points) > 3 and len(cnt2_points) > 3:
-                # Resample to same number of points
-                n_points = min(100, min(len(cnt1_points), len(cnt2_points)))
-                
-                if len(cnt1_points) > n_points:
-                    idx = np.linspace(0, len(cnt1_points)-1, n_points, dtype=int)
-                    p1 = cnt1_points[idx]
-                else:
-                    p1 = cnt1_points
-                    
-                if len(cnt2_points) > n_points:
-                    idx = np.linspace(0, len(cnt2_points)-1, n_points, dtype=int)
-                    p2 = cnt2_points[idx]
-                else:
-                    p2 = cnt2_points
-                
-                # Pad to same length
+            if len(poly1) >= 3 and len(poly2) >= 3:
+                n_points = min(64, max(len(poly1), len(poly2)))
+                p1 = self._resample_points(poly1, n_points)
+                p2 = self._resample_points(poly2, n_points)
                 max_len = max(len(p1), len(p2))
                 if len(p1) < max_len:
                     pad = np.tile(p1[-1:], (max_len - len(p1), 1))
@@ -4911,25 +5356,44 @@ class ScientificGlyphAnalyzer:
                 result["procrustes_similarity"] = 0
         except Exception:
             result["procrustes_similarity"] = 0
-        
-        # 3. Skeleton overlap (structural similarity)
-        # Resize larger to match smaller
-        h1, w1 = sk1.shape[:2]
-        h2, w2 = sk2.shape[:2]
+
+        vec1 = np.array(model1.get("signature", {}).get("shape_vector", []), dtype=np.float32)
+        vec2 = np.array(model2.get("signature", {}).get("shape_vector", []), dtype=np.float32)
+        if len(vec1) and len(vec2):
+            max_len = max(len(vec1), len(vec2))
+            vec1 = np.pad(vec1, (0, max_len - len(vec1)))
+            vec2 = np.pad(vec2, (0, max_len - len(vec2)))
+            denom = np.maximum(np.maximum(np.abs(vec1), np.abs(vec2)), 1.0)
+            distance = float(np.linalg.norm((vec1 - vec2) / denom))
+            vector_similarity = max(0, 1 - distance / math.sqrt(max_len))
+        else:
+            vector_similarity = 0
+        result["shape_vector_similarity"] = float(f"{vector_similarity:.4f}")
+
+        h1, w1 = glyph1_mask.shape[:2]
+        h2, w2 = glyph2_mask.shape[:2]
         target_h, target_w = min(h1, h2), min(w1, w2)
-        
-        sk1_resized = cv2.resize(sk1, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
-        sk2_resized = cv2.resize(sk2, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
-        
-        intersection = np.sum((sk1_resized > 0) & (sk2_resized > 0))
-        union = np.sum((sk1_resized > 0) | (sk2_resized > 0))
+        m1 = cv2.resize((glyph1_mask > 0).astype(np.uint8), (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+        m2 = cv2.resize((glyph2_mask > 0).astype(np.uint8), (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+        intersection = np.sum((m1 > 0) & (m2 > 0))
+        union = np.sum((m1 > 0) | (m2 > 0))
         overlap = intersection / max(union, 1)
-        result["structural_overlap"] = float(f"{overlap:.4f}")
-        
-        # Overall structural similarity score
-        result["overall_similarity"] = float(f"{(result.get('hausdorff_similarity', 0) * 0.3 + result.get('procrustes_similarity', 0) * 0.3 + overlap * 0.4):.4f}")
-        
+        result["polygon_overlap"] = float(f"{overlap:.4f}")
+
+        result["overall_similarity"] = float(f"{(result.get('hausdorff_similarity', 0) * 0.25 + result.get('procrustes_similarity', 0) * 0.25 + vector_similarity * 0.25 + overlap * 0.25):.4f}")
         return result
+
+    def _resample_points(self, points, n_points):
+        points = np.asarray(points, dtype=np.float32)
+        if len(points) == 0:
+            return points
+        if len(points) == n_points:
+            return points
+        idx = np.linspace(0, len(points) - 1, n_points)
+        low = np.floor(idx).astype(int)
+        high = np.ceil(idx).astype(int)
+        frac = (idx - low).reshape(-1, 1)
+        return points[low] * (1 - frac) + points[high] * frac
     
     def compute_structural_distance(self, metrics_a, metrics_b):
         """Compute structural distance between two glyphs' metrics.
@@ -4937,20 +5401,20 @@ class ScientificGlyphAnalyzer:
         Uses feature vector comparison (Euclidean distance on normalized features).
         """
         features_a = np.array([
-            metrics_a.get("junction_count", 0),
-            metrics_a.get("endpoint_count", 0),
-            metrics_a.get("branch_count", 0),
-            metrics_a.get("avg_stroke_length", 0),
+            metrics_a.get("polygon_vertices", metrics_a.get("junction_count", 0)),
+            metrics_a.get("triangle_count", metrics_a.get("endpoint_count", 0)),
+            metrics_a.get("polygon_edges", metrics_a.get("branch_count", 0)),
+            metrics_a.get("avg_triangle_area", metrics_a.get("avg_stroke_length", 0)),
             metrics_a.get("complexity_score", 0),
             metrics_a.get("aspect_ratio", 0),
             metrics_a.get("solidity", 0),
         ])
         
         features_b = np.array([
-            metrics_b.get("junction_count", 0),
-            metrics_b.get("endpoint_count", 0),
-            metrics_b.get("branch_count", 0),
-            metrics_b.get("avg_stroke_length", 0),
+            metrics_b.get("polygon_vertices", metrics_b.get("junction_count", 0)),
+            metrics_b.get("triangle_count", metrics_b.get("endpoint_count", 0)),
+            metrics_b.get("polygon_edges", metrics_b.get("branch_count", 0)),
+            metrics_b.get("avg_triangle_area", metrics_b.get("avg_stroke_length", 0)),
             metrics_b.get("complexity_score", 0),
             metrics_b.get("aspect_ratio", 0),
             metrics_b.get("solidity", 0),
@@ -6075,10 +6539,8 @@ class MainWindow(QMainWindow):
         self.analysis_progress_bar = QProgressBar()
         self.analysis_progress_bar.setFixedHeight(16)
         self.analysis_progress_bar.setValue(0)
-        self.analysis_progress_bar.setStyleSheet("""
-            QProgressBar { background: #0a0a0a; border: 1px solid #1a1a1a; border-radius: 3px; text-align: center; color: #aaaaaa; font-size: 9px; }
-            QProgressBar::chunk { background: #2255aa; border-radius: 2px; }
-        """)
+        self.analysis_progress_bar.setFormat("%p%")
+        self.analysis_progress_bar.setStyleSheet(self._analysis_progress_style("#2255aa"))
         self.analysis_complete_label = QLabel("")
         self.analysis_complete_label.setFixedWidth(20)
         self.analysis_complete_label.setStyleSheet("color: #33ff33; font-size: 14px; font-weight: bold;")
@@ -6238,15 +6700,33 @@ class MainWindow(QMainWindow):
 
     # ── Existing Methods ──────────────────────────────────────────────────
 
+    def _analysis_progress_style(self, chunk_color):
+        return f"""
+            QProgressBar {{
+                background: #0a0a0a;
+                border: 1px solid #1a1a1a;
+                border-radius: 3px;
+                text-align: center;
+                color: #dddddd;
+                font-family: Arial, 'Segoe UI', sans-serif;
+                font-size: 12px;
+                font-weight: bold;
+            }}
+            QProgressBar::chunk {{ background: {chunk_color}; border-radius: 2px; }}
+        """
+
+    def _reset_analysis_progress_bar(self):
+        self.analysis_progress_bar.setValue(0)
+        self.analysis_progress_bar.setStyleSheet(self._analysis_progress_style("#2255aa"))
+        self.analysis_complete_label.setText("")
+
     def _update_analysis_progress(self, value):
         self.analysis_progress_bar.setValue(value)
         if value == 100:
-            self.analysis_progress_bar.setStyleSheet("""
-                QProgressBar { background: #0a0a0a; border: 1px solid #1a1a1a; border-radius: 3px; text-align: center; color: #aaaaaa; font-size: 9px; }
-                QProgressBar::chunk { background: #22aa55; border-radius: 2px; }
-            """)
+            self.analysis_progress_bar.setStyleSheet(self._analysis_progress_style("#22aa55"))
             self.analysis_complete_label.setText("✓")
         elif value > 0:
+            self.analysis_progress_bar.setStyleSheet(self._analysis_progress_style("#2255aa"))
             self.analysis_complete_label.setText("")
 
     def _update_analysis_elapsed(self, text):
@@ -6255,33 +6735,20 @@ class MainWindow(QMainWindow):
     def _on_analysis_completed(self, completed):
         if completed:
             self.analysis_progress_bar.setValue(100)
-            self.analysis_progress_bar.setStyleSheet("""
-                QProgressBar { background: #0a0a0a; border: 1px solid #1a1a1a; border-radius: 3px; text-align: center; color: #aaaaaa; font-size: 9px; }
-                QProgressBar::chunk { background: #22aa55; border-radius: 2px; }
-            """)
+            self.analysis_progress_bar.setStyleSheet(self._analysis_progress_style("#22aa55"))
             self.analysis_complete_label.setText("✓")
             QMessageBox.information(self, "Analysis Done", "Analysis done.")
+            QTimer.singleShot(1200, self._reset_analysis_progress_bar)
 
     def _on_analysis_paused(self, paused):
         if paused:
-            self.analysis_progress_bar.setStyleSheet("""
-                QProgressBar { background: #0a0a0a; border: 1px solid #1a1a1a; border-radius: 3px; text-align: center; color: #aaaaaa; font-size: 9px; }
-                QProgressBar::chunk { background: #aaaa22; border-radius: 2px; }
-            """)
+            self.analysis_progress_bar.setStyleSheet(self._analysis_progress_style("#aaaa22"))
         else:
-            self.analysis_progress_bar.setStyleSheet("""
-                QProgressBar { background: #0a0a0a; border: 1px solid #1a1a1a; border-radius: 3px; text-align: center; color: #aaaaaa; font-size: 9px; }
-                QProgressBar::chunk { background: #2255aa; border-radius: 2px; }
-            """)
+            self.analysis_progress_bar.setStyleSheet(self._analysis_progress_style("#2255aa"))
 
     def _on_analysis_stopped(self, stopped):
         if stopped:
-            self.analysis_progress_bar.setValue(0)
-            self.analysis_progress_bar.setStyleSheet("""
-                QProgressBar { background: #0a0a0a; border: 1px solid #1a1a1a; border-radius: 3px; text-align: center; color: #aaaaaa; font-size: 9px; }
-                QProgressBar::chunk { background: #2255aa; border-radius: 2px; }
-            """)
-            self.analysis_complete_label.setText("")
+            self._reset_analysis_progress_bar()
             self.analysis_timer_label.setText("Analysis time: 00:00")
 
     def closeEvent(self, event):
