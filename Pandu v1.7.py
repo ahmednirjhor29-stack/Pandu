@@ -142,11 +142,21 @@ class AIDatabaseManager:
                 artifact_name TEXT,
                 source_image_path TEXT,
                 glyph_image_path TEXT,
+                glyph_data_path TEXT,
                 glyph_index INTEGER,
                 bbox TEXT,
                 glyph_name TEXT,
                 modern_equivalent TEXT,
                 writing_system TEXT,
+                notes TEXT,
+                created_at TEXT)""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS geometric_analysis_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                artifact_name TEXT,
+                source_image_path TEXT,
+                glyph_count INTEGER,
+                glyph_data_dir TEXT,
+                pdf_report_path TEXT,
                 notes TEXT,
                 created_at TEXT)""")
             # Migration safety: add columns to older DBs that may not have them yet
@@ -171,6 +181,22 @@ class AIDatabaseManager:
             for col, col_type in geometry_cols.items():
                 if col not in existing_cols:
                     conn.execute(f"ALTER TABLE ai_analysis_db ADD COLUMN {col} {col_type}")
+            glyph_cols = [row[1] for row in conn.execute("PRAGMA table_info(ai_glyphs)").fetchall()]
+            if "glyph_data_path" not in glyph_cols:
+                conn.execute("ALTER TABLE ai_glyphs ADD COLUMN glyph_data_path TEXT")
+            report_cols = [row[1] for row in conn.execute("PRAGMA table_info(geometric_analysis_reports)").fetchall()]
+            report_schema = {
+                "artifact_name": "TEXT",
+                "source_image_path": "TEXT",
+                "glyph_count": "INTEGER",
+                "glyph_data_dir": "TEXT",
+                "pdf_report_path": "TEXT",
+                "notes": "TEXT",
+                "created_at": "TEXT",
+            }
+            for col, col_type in report_schema.items():
+                if col not in report_cols:
+                    conn.execute(f"ALTER TABLE geometric_analysis_reports ADD COLUMN {col} {col_type}")
 
 DatabaseManager.init_db()
 AIDatabaseManager.init_db()
@@ -2105,7 +2131,7 @@ class AIAnalysisPage(QWidget):
             self.append_log(f"[Pipeline Resume] Reusing AI extraction: {self._pipeline_ai_json_path}")
             if not need_geometry:
                 self.progress_updated.emit(100)
-                self._notify_pipeline_complete()
+                self._finish_ai_extraction_complete()
                 return
         elif is_cloud:
             api_key = self.get_gemini_api_key()
@@ -2191,9 +2217,30 @@ class AIAnalysisPage(QWidget):
             self.pause_btn.setText("⏸  Pause")
             if self._pipeline_record_ids:
                 self.progress_updated.emit(100)
-                self._notify_pipeline_complete()
+                self._finish_ai_extraction_complete()
             else:
                 self.progress_updated.emit(0)
+
+    def _finish_ai_extraction_complete(self):
+        self._finish_pipeline_timer()
+        if self._pipeline_progress_path:
+            try:
+                progress = {}
+                if os.path.exists(self._pipeline_progress_path):
+                    with open(self._pipeline_progress_path, "r", encoding="utf-8") as f:
+                        progress = json.load(f)
+                progress.update({
+                    "status": "complete",
+                    "updated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                    "elapsed_seconds": self._pipeline_elapsed_seconds,
+                    "record_ids": self._pipeline_record_ids,
+                })
+                with open(self._pipeline_progress_path, "w", encoding="utf-8") as f:
+                    json.dump(progress, f, indent=2)
+            except Exception as exc:
+                self.append_log(f"[Pipeline Progress Error] {exc}")
+        self.append_log(f"[AI Extraction] Total analysis time: {self._format_elapsed(self._pipeline_elapsed_seconds)}")
+        self.analysis_completed.emit(True)
 
     def _finished_image_analysis(self, success, err):
         self._image_analysis_timeout_timer.stop()
@@ -2224,7 +2271,7 @@ class AIAnalysisPage(QWidget):
             self._write_pipeline_progress("running")
             if not (self._geometry_analysis_worker and self._geometry_analysis_worker.isRunning()):
                 self.progress_updated.emit(100)
-                self._notify_pipeline_complete()
+                self._finish_ai_extraction_complete()
             else:
                 self.progress_updated.emit(70)
             self.append_log(f"[Pipeline] AI extraction saved: {ai_path}")
@@ -2767,16 +2814,16 @@ class AIDatabasePage(QWidget):
         top.addWidget(sep); top.addWidget(clear_all); top.addStretch()
         layout.addLayout(top)
         self.table = QTableWidget()
-        self.table.setColumnCount(17)
+        self.table.setColumnCount(16)
         self.table.setHorizontalHeaderLabels([
-            "Area", "PDF", "ID", "Artifact Name", "Model Used", "Confidence Score",
+            "Area", "ID", "Artifact Name", "Model Used", "Confidence Score",
             "Glyphs", "Area px", "Complexity", "Junctions", "Endpoints", "Branches",
             "Transcription", "Translation", "Notes", "Writing System", "Actions"
         ])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(12, QHeaderView.ResizeMode.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(14, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(11, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(13, QHeaderView.ResizeMode.Stretch)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         layout.addWidget(self.table)
         self.load_data()
@@ -2839,9 +2886,6 @@ class AIDatabasePage(QWidget):
             image_path = row[9] if len(row) > 9 else ""
             if not (overlay_path and os.path.exists(overlay_path)):
                 overlay_path = self.find_analyzed_area_for_artifact(row[1])
-            pdf_path = row[17] if len(row) > 17 else ""
-            if not (pdf_path and os.path.exists(pdf_path)):
-                pdf_path = self.find_pdf_report_for_artifact(row[1])
             area_btn = QPushButton()
             area_btn.setFixedSize(34, 28)
             area_btn.setToolTip("Show AI analysed text areas")
@@ -2858,29 +2902,6 @@ class AIDatabasePage(QWidget):
                 area_btn.setEnabled(False)
             self.table.setCellWidget(r_idx, 0, area_btn)
 
-            pdf_btn = QPushButton()
-            pdf_btn.setFixedSize(44, 28)
-            pdf_btn.setToolTip("Open human-readable PDF analysis report")
-            pdf_icon = QIcon.fromTheme("application-pdf")
-            if pdf_icon.isNull():
-                pdf_icon = QIcon.fromTheme("x-office-document")
-            if not pdf_icon.isNull():
-                pdf_btn.setIcon(pdf_icon)
-                pdf_btn.setIconSize(QSize(22, 22))
-            else:
-                pdf_btn.setText("PDF")
-            pdf_btn.setStyleSheet(
-                "QPushButton { background: #1a0a0a; border: 1px solid #663333; color: #ffdddd; font-size: 10px; font-weight: bold; }"
-                "QPushButton:disabled { background: #090909; border-color: #181818; color: #333333; }"
-            )
-            if pdf_path and os.path.exists(pdf_path):
-                pdf_btn.setToolTip(f"Open PDF report:\n{pdf_path}")
-                pdf_btn.clicked.connect(lambda checked, p=pdf_path: self.open_pdf_report(p))
-            else:
-                pdf_btn.setToolTip("No PDF report was found for this record")
-                pdf_btn.setEnabled(False)
-            self.table.setCellWidget(r_idx, 1, pdf_btn)
-
             display_vals = [
                 row[0], row[1], row[2], row[3],
                 row[11] if len(row) > 11 else "",
@@ -2891,7 +2912,7 @@ class AIDatabasePage(QWidget):
                 row[16] if len(row) > 16 else "",
                 row[4], row[5], row[6], row[7]
             ]
-            for i, val in enumerate(display_vals, start=2):
+            for i, val in enumerate(display_vals, start=1):
                 self.table.setItem(r_idx, i, QTableWidgetItem(str(val) if val is not None else ""))
             act = QWidget(); a_lay = QHBoxLayout(act); a_lay.setContentsMargins(2, 2, 2, 2)
             e_btn = QPushButton("Edit")
@@ -2899,7 +2920,7 @@ class AIDatabasePage(QWidget):
             e_btn.clicked.connect(lambda checked, r=row: self.edit_row(r))
             d_btn.clicked.connect(lambda checked, i=row[0]: self.delete_row(i))
             a_lay.addWidget(e_btn); a_lay.addWidget(d_btn)
-            self.table.setCellWidget(r_idx, 16, act)
+            self.table.setCellWidget(r_idx, 15, act)
     def open_pdf_report(self, path):
         if not path or not os.path.exists(path):
             QMessageBox.warning(self, "PDF Missing", "The PDF report could not be found.")
@@ -3151,6 +3172,70 @@ class GeometricAnalysisPage(QWidget):
                 return out_path
         return ""
 
+    def _write_glyph_data_file(self, glyph, glyph_path, glyph_name, modern_equiv, notes):
+        glyph_dir = ensure_ai_glyph_folder()
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.splitext(os.path.basename(self._image_path))[0] or "image")
+        out_path = os.path.join(glyph_dir, f"{stamp}_{safe_name}_glyph_{glyph.get('index', 0)}.json")
+        data = {
+            "artifact_name": self._artifact_name,
+            "source_image_path": self._image_path,
+            "glyph_image_path": glyph_path,
+            "glyph_index": glyph.get("index", 0),
+            "bbox": glyph.get("bbox", []),
+            "area": glyph.get("area", ""),
+            "aspect_ratio": glyph.get("aspect_ratio", ""),
+            "solidity": glyph.get("solidity", ""),
+            "glyph_name": glyph_name,
+            "modern_equivalent": modern_equiv,
+            "notes": notes,
+            "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        return out_path
+
+    def _generate_geometric_pdf_report(self, label_data, writing_system):
+        report_dir = ensure_ai_report_folder()
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.splitext(os.path.basename(self._image_path))[0] or "image")
+        out_path = os.path.join(report_dir, f"{stamp}_{safe_name}_geometric_report.pdf")
+        try:
+            pdf = FPDF()
+            pdf.set_auto_page_break(auto=True, margin=14)
+            pdf.add_page()
+            pdf.set_font("Helvetica", "B", 16)
+            pdf.cell(0, 10, pdf_safe_text("PANDU - Geometric Glyph Analysis Report"), new_x="LMARGIN", new_y="NEXT", align="C")
+            pdf.ln(3)
+            pdf.set_font("Helvetica", "", 9)
+            pdf.multi_cell(0, 5, pdf_safe_text(
+                f"Artifact: {self._artifact_name}\n"
+                f"Image: {self._image_path}\n"
+                f"Writing system: {writing_system or 'Unknown'}\n"
+                f"Glyphs saved: {len(label_data)}\n"
+                f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            ))
+            pdf.ln(4)
+            pdf.set_font("Helvetica", "B", 12)
+            pdf.cell(0, 8, "Individual Glyph Files", new_x="LMARGIN", new_y="NEXT")
+            pdf.set_font("Helvetica", "", 8)
+            for item in label_data:
+                if pdf.get_y() > 260:
+                    pdf.add_page()
+                line = (
+                    f"Glyph {item.get('glyph_index')}: "
+                    f"name={item.get('glyph_name') or 'unnamed'} | "
+                    f"modern={item.get('modern_equivalent') or 'unmapped'} | "
+                    f"bbox={item.get('bbox')} | "
+                    f"json={item.get('glyph_data_path')}"
+                )
+                pdf.multi_cell(0, 4.5, pdf_safe_text(line))
+            pdf.output(out_path)
+            return out_path
+        except Exception as exc:
+            self.status_label.setText(f"PDF report failed: {exc}")
+            return ""
+
     def save_glyph_labels(self):
         if not self._glyphs or not self._image_path:
             QMessageBox.warning(self, "No Glyphs", "Run glyph separation before saving.")
@@ -3167,12 +3252,13 @@ class GeometricAnalysisPage(QWidget):
             modern_equiv = equiv_widget.text().strip() if isinstance(equiv_widget, QLineEdit) else ""
             notes = notes_widget.text().strip() if isinstance(notes_widget, QLineEdit) else ""
             glyph_path = self._write_glyph_preview(glyph, preview=False)
+            glyph_data_path = self._write_glyph_data_file(glyph, glyph_path, glyph_name, modern_equiv, notes)
             bbox = json.dumps(glyph.get("bbox", []))
             run_ai_insert(
-                "INSERT INTO ai_glyphs (artifact_name, source_image_path, glyph_image_path, glyph_index, bbox, glyph_name, modern_equivalent, writing_system, notes, created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO ai_glyphs (artifact_name, source_image_path, glyph_image_path, glyph_data_path, glyph_index, bbox, glyph_name, modern_equivalent, writing_system, notes, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    self._artifact_name, self._image_path, glyph_path, glyph.get("index", row), bbox,
+                    self._artifact_name, self._image_path, glyph_path, glyph_data_path, glyph.get("index", row), bbox,
                     glyph_name, modern_equiv, writing_system, notes,
                     datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 )
@@ -3183,28 +3269,27 @@ class GeometricAnalysisPage(QWidget):
                 "glyph_name": glyph_name,
                 "modern_equivalent": modern_equiv,
                 "glyph_image_path": glyph_path,
+                "glyph_data_path": glyph_data_path,
                 "notes": notes,
             })
             saved += 1
+        pdf_path = self._generate_geometric_pdf_report(label_data, writing_system)
         run_ai_insert(
-            "INSERT INTO ai_analysis_db (artifact_name, model_used, confidence_score, transcription, translation, notes, writing_system, letter_forms, image_path, glyphs_detected)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO geometric_analysis_reports (artifact_name, source_image_path, glyph_count, glyph_data_dir, pdf_report_path, notes, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 self._artifact_name,
-                "Geometric Glyph Separator",
-                "Deterministic segmentation",
-                "Glyphs separated from library image",
-                "",
-                f"Saved {saved} individual glyph record(s) from geometric analysis.",
-                writing_system,
-                json.dumps(label_data, indent=2),
                 self._image_path,
                 saved,
+                ensure_ai_glyph_folder(),
+                pdf_path,
+                f"Saved {saved} individual glyph file(s) from geometric analysis.",
+                datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             )
         )
-        self.status_label.setText(f"Saved {saved} glyph record(s) to the AI database.")
+        self.status_label.setText(f"Saved {saved} individual glyph file(s) and geometric database record.")
         self.load_saved_glyphs()
-        QMessageBox.information(self, "Glyphs Saved", f"Saved {saved} glyph record(s) to the AI database.")
+        QMessageBox.information(self, "Glyphs Saved", f"Saved {saved} individual glyph file(s).")
 
     def load_saved_glyphs(self):
         self.saved_table.setRowCount(0)
@@ -3230,6 +3315,113 @@ class GeometricAnalysisPage(QWidget):
             self.saved_table.setItem(row, 4, QTableWidgetItem(row_data[4] or ""))
             self.saved_table.setItem(row, 5, QTableWidgetItem(row_data[5] or ""))
             self.saved_table.setRowHeight(row, 48)
+
+# ── Geometric Database Page ──────────────────────────────────────────────────
+
+class GeometricDatabasePage(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setup_ui()
+        self.load_data()
+
+    def _sec(self, text):
+        l = QLabel(text)
+        l.setStyleSheet("color: #383838; font-size: 9px; font-weight: bold; letter-spacing: 2px; margin-top: 6px;")
+        return l
+
+    def setup_ui(self):
+        root = QVBoxLayout(self)
+        root.setSpacing(10)
+        self.setStyleSheet("""
+            QWidget { background: #070707; color: #b0b0b0; font-family: 'Segoe UI', Arial; font-size: 12px; }
+            QPushButton { background: #111111; border: 1px solid #282828; border-radius: 4px; padding: 5px 12px; color: #aaaaaa; font-weight: bold; }
+            QPushButton:hover { background: #181818; border-color: #404040; }
+            QTableWidget { background: #080808; border: 1px solid #1a1a1a; gridline-color: #1f1f1f; color: #cccccc; }
+            QHeaderView::section { background: #111111; color: #777777; border: 1px solid #1f1f1f; padding: 4px; }
+        """)
+        top = QHBoxLayout()
+        refresh_btn = QPushButton("⟳ Refresh")
+        refresh_btn.clicked.connect(self.load_data)
+        top.addWidget(refresh_btn)
+        top.addStretch()
+        root.addLayout(top)
+
+        root.addWidget(self._sec("GEOMETRIC PDF REPORTS"))
+        self.report_table = QTableWidget()
+        self.report_table.setColumnCount(7)
+        self.report_table.setHorizontalHeaderLabels(["PDF", "ID", "Artifact", "Glyphs", "Glyph Data Folder", "Created", "Notes"])
+        self.report_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.report_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.report_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        self.report_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        root.addWidget(self.report_table, 2)
+
+        root.addWidget(self._sec("INDIVIDUAL GLYPH FILES"))
+        self.glyph_table = QTableWidget()
+        self.glyph_table.setColumnCount(8)
+        self.glyph_table.setHorizontalHeaderLabels(["Glyph", "ID", "Artifact", "Name", "Equivalent", "Image File", "JSON File", "Created"])
+        self.glyph_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.glyph_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.glyph_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        self.glyph_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        self.glyph_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        root.addWidget(self.glyph_table, 3)
+
+    def load_data(self):
+        self.load_reports()
+        self.load_glyphs()
+
+    def load_reports(self):
+        self.report_table.setRowCount(0)
+        rows = run_ai_query(
+            "SELECT id, artifact_name, glyph_count, glyph_data_dir, pdf_report_path, created_at, notes "
+            "FROM geometric_analysis_reports ORDER BY id DESC",
+            fetch=True
+        )
+        for data in rows:
+            row = self.report_table.rowCount()
+            self.report_table.insertRow(row)
+            pdf_path = data[4] or ""
+            pdf_btn = QPushButton("PDF")
+            pdf_btn.setFixedSize(50, 26)
+            if pdf_path and os.path.exists(pdf_path):
+                pdf_btn.setToolTip(pdf_path)
+                pdf_btn.clicked.connect(lambda checked, p=pdf_path: self.open_pdf_report(p))
+            else:
+                pdf_btn.setEnabled(False)
+            self.report_table.setCellWidget(row, 0, pdf_btn)
+            for col, value in enumerate([data[0], data[1], data[2], data[3], data[5], data[6]], start=1):
+                self.report_table.setItem(row, col, QTableWidgetItem(str(value) if value is not None else ""))
+
+    def load_glyphs(self):
+        self.glyph_table.setRowCount(0)
+        rows = run_ai_query(
+            "SELECT id, artifact_name, glyph_image_path, glyph_data_path, glyph_name, modern_equivalent, created_at "
+            "FROM ai_glyphs ORDER BY id DESC LIMIT 500",
+            fetch=True
+        )
+        for data in rows:
+            row = self.glyph_table.rowCount()
+            self.glyph_table.insertRow(row)
+            glyph_label = QLabel()
+            glyph_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            pix = QPixmap(data[2] or "")
+            if not pix.isNull():
+                glyph_label.setPixmap(pix.scaled(42, 42, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+            else:
+                glyph_label.setText("Glyph")
+            self.glyph_table.setCellWidget(row, 0, glyph_label)
+            values = [data[0], data[1], data[4], data[5], data[2], data[3], data[6]]
+            for col, value in enumerate(values, start=1):
+                self.glyph_table.setItem(row, col, QTableWidgetItem(str(value) if value is not None else ""))
+            self.glyph_table.setRowHeight(row, 48)
+
+    def open_pdf_report(self, path):
+        if not path or not os.path.exists(path):
+            QMessageBox.warning(self, "PDF Missing", "The geometric PDF report could not be found.")
+            return
+        if not open_file_with_system_app(path):
+            QMessageBox.warning(self, "Open PDF", f"Could not open PDF viewer for:\n{path}")
 
 # ── Training Worker ─────────────────────────────────────────────────────────
 
@@ -5783,14 +5975,14 @@ class MainWindow(QMainWindow):
         toolbar_layout = QHBoxLayout(self.toolbar_frame)
         toolbar_layout.setContentsMargins(6, 3, 6, 3)
         toolbar_layout.setSpacing(4)
-        items = ["Data Entry", "Library", "AI Analysis", "AI Database", "Geometric Analysis", "Train", "Script Analysis"]
+        items = ["Data Entry", "Library", "AI Analysis", "AI Database", "Geometric Analysis", "Geometric Database", "Train", "Script Analysis"]
         self.btns = {}
         for item in items:
             btn = QPushButton(item)
-            btn.setFixedSize(128 if item == "Geometric Analysis" else 104, 28)
+            btn.setFixedSize(110 if item in ("Geometric Analysis", "Geometric Database") else 86, 28)
             btn.setCheckable(True)
             btn.setStyleSheet("""
-                QPushButton { text-align: center; background: #0d0d0d; border: 1px solid #141414; color: #777; font-size: 11px; border-radius: 3px; }
+                QPushButton { text-align: center; background: #0d0d0d; border: 1px solid #141414; color: #777; font-size: 10px; border-radius: 3px; }
                 QPushButton:hover { background: #121212; color: #bbb; }
                 QPushButton:checked { background: #161616; border-color: #bb4400; color: #bb4400; font-weight: bold; }
             """)
@@ -5811,13 +6003,14 @@ class MainWindow(QMainWindow):
         self.ai_analysis_page = AIAnalysisPage()
         self.ai_database_page = AIDatabasePage()
         self.geometric_analysis_page = GeometricAnalysisPage()
+        self.geometric_database_page = GeometricDatabasePage()
         self.train_page = TrainPage()
         self.script_analysis_page = ScriptAnalysisPage()
         self.data_page.goToLibrary.connect(self.saved_to_library)
         pages = [
             self.data_page, self.library_page, self.ai_analysis_page,
             self.ai_database_page, self.geometric_analysis_page,
-            self.train_page, self.script_analysis_page
+            self.geometric_database_page, self.train_page, self.script_analysis_page
         ]
         self.pages = {}
         for idx, name in enumerate(items):
@@ -6061,6 +6254,8 @@ class MainWindow(QMainWindow):
             elif name == "Geometric Analysis":
                 self.geometric_analysis_page.refresh_library_images()
                 self.geometric_analysis_page.load_saved_glyphs()
+            elif name == "Geometric Database":
+                self.geometric_database_page.load_data()
             elif name == "Train":
                 self.train_page.refresh_ai_db_path()
                 self.train_page.load_training_records()
