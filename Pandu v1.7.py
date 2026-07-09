@@ -1874,6 +1874,55 @@ class AIAnalysisPage(QWidget):
         self._pipeline_started_at = None
         self.elapsed_updated.emit(f"Analysis time: {self._format_elapsed(self._pipeline_elapsed_seconds)}")
 
+    def _ai_record_exists(self, record_id):
+        if not record_id:
+            return False
+        try:
+            rows = run_ai_query("SELECT 1 FROM ai_analysis_db WHERE id = ? LIMIT 1", (record_id,), fetch=True)
+            return bool(rows)
+        except Exception:
+            return False
+
+    def _create_ai_record_from_extraction_file(self, json_path):
+        if not json_path or not os.path.exists(json_path):
+            return None
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            img_path = data.get("image_path", "")
+            result = data.get("result", "") or "Analysis completed"
+            model_used = data.get("model_used", CURRENT_SETTINGS.get("active_model", ""))
+            writing_system = data.get("writing_system_detected", "")
+            return run_ai_insert(
+                "INSERT INTO ai_analysis_db (artifact_name, model_used, confidence_score, transcription, translation, notes, writing_system, letter_forms)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    os.path.basename(img_path) if img_path else "AI extraction",
+                    model_used,
+                    "N/A",
+                    result,
+                    "N/A",
+                    f"AI script/text extraction phase\nSource JSON: {json_path}",
+                    writing_system,
+                    "",
+                )
+            )
+        except Exception as exc:
+            self.append_log(f"[AI Database Error] Could not restore AI record: {exc}")
+            return None
+
+    def _ensure_ai_extraction_db_record(self):
+        valid_ids = [record_id for record_id in self._pipeline_record_ids if self._ai_record_exists(record_id)]
+        if valid_ids:
+            self._pipeline_record_ids = valid_ids
+            return valid_ids[0]
+        record_id = self._create_ai_record_from_extraction_file(self._pipeline_ai_json_path)
+        if record_id:
+            self._pipeline_record_ids = [record_id]
+            self._write_pipeline_progress("running")
+            self.append_log(f"[AI Database] Restored AI extraction record #{record_id}.")
+        return record_id
+
     def check_ollama_status(self):
         base_url = self.ollama_url_input.text().strip()
         CURRENT_SETTINGS["ollama_url"] = base_url
@@ -2094,6 +2143,7 @@ class AIAnalysisPage(QWidget):
         elif progress_data and progress_data.get("status") == "complete":
             self._apply_pipeline_progress(progress_data)
             pdf_path = progress_data.get("pdf", {}).get("path", "")
+            self._ensure_ai_extraction_db_record()
             if pdf_path and os.path.exists(pdf_path):
                 self.append_log(f"[Pipeline Resume] Completed report already exists: {pdf_path}")
                 self.progress_updated.emit(100)
@@ -2222,6 +2272,7 @@ class AIAnalysisPage(QWidget):
                 self.progress_updated.emit(0)
 
     def _finish_ai_extraction_complete(self):
+        self._ensure_ai_extraction_db_record()
         self._finish_pipeline_timer()
         if self._pipeline_progress_path:
             try:
