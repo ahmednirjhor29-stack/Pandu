@@ -11,7 +11,16 @@ import stat
 import threading
 import datetime
 import math
+import re
+import hashlib
 from fpdf import FPDF
+import cv2
+import numpy as np
+from skimage.morphology import medial_axis, skeletonize
+from skimage.measure import label, regionprops
+from scipy.spatial import procrustes
+from scipy.spatial.distance import directed_hausdorff
+import collections
 try:
     from google import genai
     from google.genai import types
@@ -25,8 +34,8 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem, QHeaderView, QDialog, QTextEdit, QFrame, QSizePolicy,
     QTabWidget, QGridLayout, QGroupBox, QSplitter, QToolButton
 )
-from PyQt6.QtGui import QIcon, QPixmap, QColor, QFont, QTextCursor, QPainter, QBrush, QPen, QFontMetrics, QLinearGradient, QCursor
-from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer, QRect, QSize, QPoint
+from PyQt6.QtGui import QIcon, QPixmap, QColor, QFont, QTextCursor, QPainter, QBrush, QPen, QFontMetrics, QLinearGradient, QCursor, QDesktopServices
+from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer, QRect, QSize, QPoint, QUrl
 
 SETTINGS_FILE = os.path.join(os.path.expanduser("~"), ".pandu_settings.json")
 DEFAULT_DB_DIR = os.path.join(os.path.expanduser("~"), ".pandu_database")
@@ -40,7 +49,15 @@ DEFAULT_SETTINGS = {
     "db_directory": DEFAULT_DB_DIR,
     "active_model": "",
     "ai_mode": "local",
-    "active_gemini_model": "gemini-3.5-flash"
+    "active_gemini_model": "gemini-3.5-flash",
+    "pipeline_config": {
+        "gaussian_blur_k": 5,
+        "adaptive_threshold_block": 11,
+        "adaptive_threshold_c": 2,
+        "min_branch_length": 3,
+        "aspect_ratio_weight": 1.0,
+        "solidity_weight": 1.0
+    }
 }
 
 def load_settings():
@@ -120,6 +137,18 @@ class AIDatabaseManager:
                 id INTEGER PRIMARY KEY AUTOINCREMENT, session_id INTEGER,
                 timestamp TEXT, message TEXT, epoch INTEGER,
                 loss REAL, accuracy REAL)""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS ai_glyphs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                artifact_name TEXT,
+                source_image_path TEXT,
+                glyph_image_path TEXT,
+                glyph_index INTEGER,
+                bbox TEXT,
+                glyph_name TEXT,
+                modern_equivalent TEXT,
+                writing_system TEXT,
+                notes TEXT,
+                created_at TEXT)""")
             # Migration safety: add columns to older DBs that may not have them yet
             cur = conn.execute("PRAGMA table_info(ai_analysis_db)")
             existing_cols = [row[1] for row in cur.fetchall()]
@@ -127,6 +156,21 @@ class AIDatabaseManager:
                 conn.execute("ALTER TABLE ai_analysis_db ADD COLUMN writing_system TEXT")
             if "letter_forms" not in existing_cols:
                 conn.execute("ALTER TABLE ai_analysis_db ADD COLUMN letter_forms TEXT")
+            if "pdf_report_path" not in existing_cols:
+                conn.execute("ALTER TABLE ai_analysis_db ADD COLUMN pdf_report_path TEXT")
+            geometry_cols = {
+                "image_path": "TEXT",
+                "analyzed_area_image_path": "TEXT",
+                "glyphs_detected": "INTEGER",
+                "total_glyph_area_px": "INTEGER",
+                "avg_complexity_score": "REAL",
+                "total_junction_points": "INTEGER",
+                "total_endpoints": "INTEGER",
+                "total_stroke_branches": "INTEGER",
+            }
+            for col, col_type in geometry_cols.items():
+                if col not in existing_cols:
+                    conn.execute(f"ALTER TABLE ai_analysis_db ADD COLUMN {col} {col_type}")
 
 DatabaseManager.init_db()
 AIDatabaseManager.init_db()
@@ -140,6 +184,102 @@ def run_ai_query(query, params=(), fetch=False):
     with AIDatabaseManager.get_connection() as conn:
         cursor = conn.execute(query, params)
         return cursor.fetchall() if fetch else conn.commit()
+
+def run_ai_insert(query, params=()):
+    with AIDatabaseManager.get_connection() as conn:
+        cursor = conn.execute(query, params)
+        conn.commit()
+        return cursor.lastrowid
+
+def ensure_ai_pipeline_folders():
+    base_dir = AIDatabaseManager.get_dir()
+    ai_dir = os.path.join(base_dir, "ai_extraction_data")
+    math_dir = os.path.join(base_dir, "mathematical_analysis_data")
+    os.makedirs(ai_dir, exist_ok=True)
+    os.makedirs(math_dir, exist_ok=True)
+    return ai_dir, math_dir
+
+def ensure_ai_report_folder():
+    report_dir = os.path.join(AIDatabaseManager.get_dir(), "pdf_analysis_reports")
+    os.makedirs(report_dir, exist_ok=True)
+    return report_dir
+
+def ensure_ai_glyph_folder():
+    glyph_dir = os.path.join(AIDatabaseManager.get_dir(), "glyph_extraction_data")
+    os.makedirs(glyph_dir, exist_ok=True)
+    return glyph_dir
+
+def ensure_pipeline_progress_folder():
+    progress_dir = os.path.join(AIDatabaseManager.get_dir(), "pipeline_progress")
+    os.makedirs(progress_dir, exist_ok=True)
+    return progress_dir
+
+def pdf_safe_text(value):
+    text = "" if value is None else str(value)
+    replacements = {
+        "→": "->", "—": "-", "–": "-", "•": "-", "✓": "OK",
+        "×": "x", "π": "pi", "²": "^2", "°": " degrees"
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return text.encode("latin-1", "replace").decode("latin-1")
+
+def open_file_with_system_app(path):
+    if not path or not os.path.exists(path):
+        return False
+    abs_path = os.path.abspath(path)
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(abs_path)
+            return True
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", abs_path])
+            return True
+        if abs_path.lower().endswith(".pdf"):
+            for app in ("xreader", "evince", "okular", "atril"):
+                opener = shutil.which(app)
+                if opener:
+                    subprocess.Popen(
+                        [opener, abs_path],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL
+                    )
+                    return True
+        gio = shutil.which("gio")
+        if gio:
+            subprocess.Popen(
+                [gio, "open", abs_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            return True
+        opener = shutil.which("xdg-open")
+        if opener:
+            subprocess.Popen(
+                [opener, abs_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            return True
+    except Exception:
+        pass
+    return QDesktopServices.openUrl(QUrl.fromLocalFile(abs_path))
+
+def make_json_safe(value):
+    if isinstance(value, dict):
+        return {str(k): make_json_safe(v) for k, v in value.items() if k not in {"mask", "gray", "contour_points", "contour_simplified"}}
+    if isinstance(value, (list, tuple)):
+        return [make_json_safe(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return {
+            "array_shape": list(value.shape),
+            "array_dtype": str(value.dtype)
+        }
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    return value
 
 # ── Permission Manager ────────────────────────────────────────────────────────
 
@@ -444,6 +584,39 @@ class LocalImageAnalysisWorker(QThread):
         except Exception as e:
             self.finished_signal.emit(False, str(e))
 
+class GeometricAnalysisWorker(QThread):
+    finished_signal = pyqtSignal(bool, str, object)
+
+    def __init__(self, image_path):
+        super().__init__()
+        self.image_path = image_path
+
+    def run(self):
+        try:
+            analyzer = ScientificGlyphAnalyzer()
+            result = analyzer.full_pipeline(self.image_path)
+            if result.get("status") == "error":
+                self.finished_signal.emit(False, result.get("error", "Geometric analysis failed"), result)
+            else:
+                self.finished_signal.emit(True, "", result)
+        except Exception as e:
+            self.finished_signal.emit(False, str(e), {})
+
+class GlyphSegmentationWorker(QThread):
+    finished_signal = pyqtSignal(bool, str, object)
+
+    def __init__(self, image_path):
+        super().__init__()
+        self.image_path = image_path
+
+    def run(self):
+        try:
+            analyzer = ScientificGlyphAnalyzer()
+            result = analyzer.phase1_clean_and_extract(self.image_path)
+            self.finished_signal.emit(True, "", result)
+        except Exception as e:
+            self.finished_signal.emit(False, str(e), {})
+
 class TerminalWorker(QThread):
     output_ready = pyqtSignal(str)
     finished_signal = pyqtSignal()
@@ -629,6 +802,95 @@ class PlaceholderPage(QWidget):
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         layout.addWidget(QLabel(f"{title} — coming soon"))
+
+# ── Pipeline Configurations Extra Overlay Panel ──────────────────────────────
+
+class PipelineSettingsDialog(QDialog):
+    """Extra settings overlay panel for configuring the CV/Geometric Analysis Pipeline without breaking core UI designs."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Computer Vision & Geometric Pipeline Config")
+        self.setFixedSize(450, 360)
+        self.setStyleSheet("""
+            QDialog { background: #070707; color: #b0b0b0; font-family: 'Segoe UI', Arial; font-size: 12px; }
+            QLabel { color: #aaaaaa; }
+            QLineEdit { background: #0f0f0f; border: 1px solid #252525; border-radius: 4px; padding: 4px 6px; color: #dddddd; }
+            QLineEdit:focus { border-color: #bb4400; }
+            QPushButton { background: #111111; border: 1px solid #282828; border-radius: 4px; padding: 6px 14px; color: #aaaaaa; font-weight: bold; }
+            QPushButton:hover { background: #181818; border-color: #404040; }
+        """)
+        self.settings = load_settings()
+        self.config = self.settings.get("pipeline_config", DEFAULT_SETTINGS["pipeline_config"])
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        header = QLabel("Dual-Phase Processing Tuning Parameters")
+        header.setStyleSheet("color: #bb4400; font-weight: bold; font-size: 13px; margin-bottom: 5px;")
+        layout.addWidget(header)
+
+        form_layout = QGridLayout()
+        form_layout.setSpacing(8)
+
+        # Phase 1: CV Extract Configurations
+        form_layout.addWidget(QLabel("<b>Phase 1: Computer Vision Filtering</b>"), 0, 0, 1, 2)
+
+        form_layout.addWidget(QLabel("Gaussian Blur Kernel Size:"), 1, 0)
+        self.blur_input = QLineEdit(str(self.config.get("gaussian_blur_k", 5)))
+        form_layout.addWidget(self.blur_input, 1, 1)
+
+        form_layout.addWidget(QLabel("Adaptive Threshold Block Size:"), 2, 0)
+        self.block_input = QLineEdit(str(self.config.get("adaptive_threshold_block", 11)))
+        form_layout.addWidget(self.block_input, 2, 1)
+
+        form_layout.addWidget(QLabel("Adaptive Threshold C Constant:"), 3, 0)
+        self.c_input = QLineEdit(str(self.config.get("adaptive_threshold_c", 2)))
+        form_layout.addWidget(self.c_input, 3, 1)
+
+        # Phase 2: Geometric Configurations
+        form_layout.addWidget(QLabel("<b>Phase 2: Mathematical Skeleton Metrics</b>"), 4, 0, 1, 2)
+
+        form_layout.addWidget(QLabel("Minimum Branch Pruning Length:"), 5, 0)
+        self.prune_input = QLineEdit(str(self.config.get("min_branch_length", 3)))
+        form_layout.addWidget(self.prune_input, 5, 1)
+
+        form_layout.addWidget(QLabel("Feature Normalization Aspect Weight:"), 6, 0)
+        self.aspect_input = QLineEdit(str(self.config.get("aspect_ratio_weight", 1.0)))
+        form_layout.addWidget(self.aspect_input, 6, 1)
+
+        form_layout.addWidget(QLabel("Feature Normalization Solidity Weight:"), 7, 0)
+        self.solidity_input = QLineEdit(str(self.config.get("solidity_weight", 1.0)))
+        form_layout.addWidget(self.solidity_input, 7, 1)
+
+        layout.addLayout(form_layout)
+        layout.addStretch()
+
+        btn_row = QHBoxLayout()
+        save_btn = QPushButton("Save Config")
+        cancel_btn = QPushButton("Cancel")
+        save_btn.clicked.connect(self.save_config)
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addStretch()
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(save_btn)
+        layout.addLayout(btn_row)
+
+    def save_config(self):
+        try:
+            self.config["gaussian_blur_k"] = int(self.blur_input.text())
+            self.config["adaptive_threshold_block"] = int(self.block_input.text())
+            self.config["adaptive_threshold_c"] = int(self.c_input.text())
+            self.config["min_branch_length"] = int(self.prune_input.text())
+            self.config["aspect_ratio_weight"] = float(self.aspect_input.text())
+            self.config["solidity_weight"] = float(self.solidity_input.text())
+
+            self.settings["pipeline_config"] = self.config
+            save_settings(self.settings)
+            self.accept()
+        except ValueError:
+            QMessageBox.critical(self, "Validation Error", "Please verify all fields contain proper continuous scalar inputs.")
 
 # ── Integrated Data Entry Page ────────────────────────────────────────────────
 
@@ -915,6 +1177,7 @@ class ChatBubble(QFrame):
 
 class AIAnalysisPage(QWidget):
     progress_updated = pyqtSignal(int)
+    elapsed_updated = pyqtSignal(str)
     analysis_completed = pyqtSignal(bool)
     analysis_paused_state = pyqtSignal(bool)
     analysis_stopped_state = pyqtSignal(bool)
@@ -929,9 +1192,27 @@ class AIAnalysisPage(QWidget):
         self._local_chat_thread = None
         self._gemini_worker = None
         self._image_analysis_worker = None
+        self._geometry_analysis_worker = None
         self._analysis_paused = False
         self._analysis_stopped = False
         self._analysis_result_buffer = ""
+        self._current_pipeline_image_path = ""
+        self._last_math_analysis_result = {}
+        self._pipeline_completion_notified = False
+        self._pipeline_record_ids = []
+        self._pipeline_ai_json_path = ""
+        self._pipeline_math_json_path = ""
+        self._pipeline_overlay_path = ""
+        self._pipeline_progress_path = ""
+        self._pipeline_started_at = None
+        self._pipeline_elapsed_seconds = 0
+        self._pipeline_timer = QTimer(self)
+        self._pipeline_timer.timeout.connect(self._update_pipeline_elapsed)
+        self._image_analysis_started_at = None
+        self._image_analysis_timeout_ms = 180000
+        self._image_analysis_timeout_timer = QTimer(self)
+        self._image_analysis_timeout_timer.setSingleShot(True)
+        self._image_analysis_timeout_timer.timeout.connect(self._handle_image_analysis_timeout)
         self._analysis_total_chunks = 0
         self._analysis_chunks_received = 0
         self._analysis_saved_count = 0
@@ -1037,6 +1318,7 @@ class AIAnalysisPage(QWidget):
         sel_row = QHBoxLayout()
         self.img_selector_combo = QComboBox()
         self.img_selector_combo.setMinimumWidth(200)
+        self.img_selector_combo.currentIndexChanged.connect(self._check_current_image_access)
         refresh_img_btn = QPushButton("⟳")
         refresh_img_btn.setFixedWidth(30)
         refresh_img_btn.clicked.connect(self.refresh_library_images)
@@ -1056,18 +1338,13 @@ class AIAnalysisPage(QWidget):
         self._access_timer.timeout.connect(self._update_access_timer)
         self._access_expiry = None
 
-        lay.addWidget(self._sec("ANALYSIS PROMPT"))
-        self.analysis_prompt_input = QTextEdit()
-        self.analysis_prompt_input.setFixedHeight(70)
-        self.analysis_prompt_input.setPlaceholderText(
-            "Describe what you want the AI to analyse in the selected image(s)...\n"
-            "e.g. 'Transcribe all visible text', 'Identify the writing system', 'Describe the artifact'")
-        self.analysis_prompt_input.setStyleSheet(
-            "QTextEdit { background: #0a0a0a; border: 1px solid #1e1e1e; color: #cccccc; font-family: 'Segoe UI'; }")
-        lay.addWidget(self.analysis_prompt_input)
+        pipeline_lbl = QLabel("AI extraction: identify visible text, script clues, and transcription candidates")
+        pipeline_lbl.setWordWrap(True)
+        pipeline_lbl.setStyleSheet("color: #777777; font-size: 10px;")
+        lay.addWidget(pipeline_lbl)
 
         btn_row = QHBoxLayout()
-        analyse_btn = QPushButton("▶  Analyse Image with AI")
+        analyse_btn = QPushButton("▶  Run AI Text Extraction")
         analyse_btn.setStyleSheet(
             "QPushButton { background: #0a1020; border: 1px solid #1a3060; color: #4488ff; font-weight: bold; padding: 6px; }"
             "QPushButton:hover { background: #0d1830; border-color: #2255aa; }"
@@ -1464,6 +1741,113 @@ class AIAnalysisPage(QWidget):
         self.terminal_output.append(text)
         self.terminal_output.moveCursor(QTextCursor.MoveOperation.End)
 
+    def _format_elapsed(self, seconds):
+        seconds = max(0, int(seconds or 0))
+        mins, secs = divmod(seconds, 60)
+        hours, mins = divmod(mins, 60)
+        if hours:
+            return f"{hours:02d}:{mins:02d}:{secs:02d}"
+        return f"{mins:02d}:{secs:02d}"
+
+    def _update_pipeline_elapsed(self):
+        if self._pipeline_started_at is not None:
+            self._pipeline_elapsed_seconds = int(time.monotonic() - self._pipeline_started_at)
+        label = f"Analysis time: {self._format_elapsed(self._pipeline_elapsed_seconds)}"
+        self.elapsed_updated.emit(label)
+        if self._pipeline_progress_path:
+            self._write_pipeline_progress("running")
+
+    def _pipeline_progress_file_for_image(self, img_path):
+        try:
+            stat_info = os.stat(img_path)
+            fingerprint = f"{os.path.abspath(img_path)}|{int(stat_info.st_mtime)}|{stat_info.st_size}"
+        except OSError:
+            fingerprint = os.path.abspath(img_path)
+        digest = hashlib.sha1(fingerprint.encode("utf-8")).hexdigest()[:16]
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.splitext(os.path.basename(img_path))[0] or "image")
+        return os.path.join(ensure_pipeline_progress_folder(), f"{safe_name}_{digest}_progress.json")
+
+    def _read_pipeline_progress(self, img_path):
+        path = self._pipeline_progress_file_for_image(img_path)
+        if not os.path.exists(path):
+            return {}, path
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("image_path") != img_path:
+                return {}, path
+            return data, path
+        except Exception:
+            return {}, path
+
+    def _write_pipeline_progress(self, status="running"):
+        if not self._pipeline_progress_path:
+            return
+        data = {
+            "status": status,
+            "image_path": self._current_pipeline_image_path,
+            "updated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "elapsed_seconds": self._pipeline_elapsed_seconds,
+            "record_ids": self._pipeline_record_ids,
+            "ai": {
+                "done": bool(self._pipeline_ai_json_path and os.path.exists(self._pipeline_ai_json_path)),
+                "json_path": self._pipeline_ai_json_path,
+                "text": self._analysis_result_buffer,
+            },
+            "geometry": {
+                "done": bool(self._pipeline_math_json_path and os.path.exists(self._pipeline_math_json_path)),
+                "json_path": self._pipeline_math_json_path,
+                "overlay_path": self._pipeline_overlay_path,
+            },
+            "pdf": {
+                "done": False,
+                "path": "",
+            }
+        }
+        try:
+            existing = {}
+            if os.path.exists(self._pipeline_progress_path):
+                with open(self._pipeline_progress_path, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+            if existing.get("pdf", {}).get("path"):
+                data["pdf"] = existing.get("pdf", data["pdf"])
+            with open(self._pipeline_progress_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception as exc:
+            self.append_log(f"[Pipeline Progress Error] {exc}")
+
+    def _load_math_result_from_progress(self, path):
+        if not path or not os.path.exists(path):
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            result = data.get("result", data)
+            if isinstance(result, dict):
+                return result
+        except Exception as exc:
+            self.append_log(f"[Pipeline Resume Error] Could not load geometry checkpoint: {exc}")
+        return {}
+
+    def _apply_pipeline_progress(self, progress):
+        self._pipeline_record_ids = [int(i) for i in progress.get("record_ids", []) if str(i).isdigit()]
+        self._pipeline_elapsed_seconds = int(progress.get("elapsed_seconds", 0) or 0)
+        ai = progress.get("ai", {}) if isinstance(progress.get("ai"), dict) else {}
+        geom = progress.get("geometry", {}) if isinstance(progress.get("geometry"), dict) else {}
+        self._pipeline_ai_json_path = ai.get("json_path", "") if ai.get("done") else ""
+        self._analysis_result_buffer = ai.get("text", "") if ai.get("done") else ""
+        self._pipeline_math_json_path = geom.get("json_path", "") if geom.get("done") else ""
+        self._pipeline_overlay_path = geom.get("overlay_path", "") if geom.get("done") else ""
+        if self._pipeline_math_json_path:
+            self._last_math_analysis_result = self._load_math_result_from_progress(self._pipeline_math_json_path)
+
+    def _finish_pipeline_timer(self):
+        self._pipeline_timer.stop()
+        if self._pipeline_started_at is not None:
+            self._pipeline_elapsed_seconds = int(time.monotonic() - self._pipeline_started_at)
+        self._pipeline_started_at = None
+        self.elapsed_updated.emit(f"Analysis time: {self._format_elapsed(self._pipeline_elapsed_seconds)}")
+
     def check_ollama_status(self):
         base_url = self.ollama_url_input.text().strip()
         CURRENT_SETTINGS["ollama_url"] = base_url
@@ -1530,9 +1914,15 @@ class AIAnalysisPage(QWidget):
 
     def stop_analysis(self):
         self._analysis_stopped = True
+        self._image_analysis_timeout_timer.stop()
         if self._image_analysis_worker and self._image_analysis_worker.isRunning():
             self._image_analysis_worker.terminate()
             self._image_analysis_worker = None
+        if self._geometry_analysis_worker and self._geometry_analysis_worker.isRunning():
+            self._geometry_analysis_worker.terminate()
+            self._geometry_analysis_worker = None
+        self._write_pipeline_progress("stopped")
+        self._finish_pipeline_timer()
         self.analyse_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
         self.stop_btn.setEnabled(False)
@@ -1542,25 +1932,92 @@ class AIAnalysisPage(QWidget):
         self._analysis_total_chunks = 0
         self._analysis_chunks_received = 0
         self._analysis_saved_count = 0
+        self._pipeline_record_ids = []
+        self._pipeline_ai_json_path = ""
+        self._pipeline_math_json_path = ""
+        self._pipeline_overlay_path = ""
+        self._pipeline_progress_path = ""
+        self._image_analysis_started_at = None
         self.progress_updated.emit(0)
         self.analysis_stopped_state.emit(True)
         self.append_log("[Analysis] Stopped by user.")
 
     def run_image_analysis(self):
         img_path = self.img_selector_combo.currentData()
-        prompt = self.analysis_prompt_input.toPlainText().strip()
         if not img_path or not os.path.exists(img_path):
             QMessageBox.warning(self, "No Image", "Please select a valid image from the library.")
             return
-        if not prompt:
-            QMessageBox.warning(self, "No Prompt", "Please enter an analysis prompt.")
-            return
         if self._image_analysis_worker is not None and self._image_analysis_worker.isRunning():
             return
+        if self._geometry_analysis_worker is not None and self._geometry_analysis_worker.isRunning():
+            return
+
+        is_cloud = self._ai_mode == "cloud"
+        if is_cloud:
+            provider = CURRENT_SETTINGS.get("active_cloud_provider", "gemini")
+            if provider != "gemini":
+                QMessageBox.critical(
+                    self,
+                    "Cloud AI Not Set Up",
+                    "The image pipeline currently supports Gemini cloud analysis only.\n\nSelect Gemini, choose a Gemini model, save the API key, and target the model before running the script pipeline."
+                )
+                return
+            if not self.get_gemini_api_key():
+                QMessageBox.critical(
+                    self,
+                    "Cloud AI Not Set Up",
+                    "The cloud AI system is not set up properly.\n\nEnter and save a Gemini API key before running the script pipeline."
+                )
+                return
+            active_model = CURRENT_SETTINGS.get("active_model", "")
+            if provider == "gemini" and not active_model.startswith("gemini:"):
+                QMessageBox.critical(
+                    self,
+                    "Cloud AI Not Targeted",
+                    "The cloud AI system is not targeted properly.\n\nChoose a cloud model and click Activate/Target before running the script pipeline."
+                )
+                return
+        else:
+            active_model = CURRENT_SETTINGS.get("active_model", "")
+            if not active_model or active_model.startswith("gemini:") or active_model.startswith("cloud:"):
+                QMessageBox.critical(
+                    self,
+                    "Local AI Not Set Up",
+                    "The local AI system is not set up properly.\n\nStart Ollama, select a local model, and click Target before running the script pipeline."
+                )
+                return
+            base_url = self.ollama_url_input.text().strip()
+            try:
+                r = requests.get(f"{base_url}/api/tags", timeout=2)
+                if r.status_code != 200:
+                    raise requests.RequestException(f"status {r.status_code}")
+                models = [m.get("name") for m in r.json().get("models", [])]
+                if active_model not in models:
+                    QMessageBox.critical(
+                        self,
+                        "Local AI Model Unavailable",
+                        f"The targeted local model is not available from Ollama:\n\n{active_model}"
+                    )
+                    return
+            except requests.exceptions.RequestException as exc:
+                QMessageBox.critical(
+                    self,
+                    "Local AI Unreachable",
+                    f"The local AI system is not reachable at:\n{base_url}\n\nStart Ollama and try again.\n\nDetails: {exc}"
+                )
+                return
 
         self._analysis_paused = False
         self._analysis_stopped = False
         self._analysis_result_buffer = ""
+        self._current_pipeline_image_path = img_path
+        self._last_math_analysis_result = {}
+        self._pipeline_completion_notified = False
+        self._pipeline_record_ids = []
+        self._pipeline_ai_json_path = ""
+        self._pipeline_math_json_path = ""
+        self._pipeline_overlay_path = ""
+        self._image_analysis_started_at = None
 
         concerns = []
         needs_permission = False
@@ -1568,7 +2025,6 @@ class AIAnalysisPage(QWidget):
             needs_permission = True
             concerns.append("• This file requires elevated permissions to read.")
 
-        is_cloud = self._ai_mode == "cloud"
         if is_cloud:
             concerns.append("• The image will be uploaded and sent to a third-party API server.")
             concerns.append("• This means image data leaves your local machine temporarily.")
@@ -1603,78 +2059,567 @@ class AIAnalysisPage(QWidget):
             self.access_status_lbl.setText("Access: Temporary access granted ✓")
             self.access_status_lbl.setStyleSheet("color: #33aa33; font-size: 10px;")
 
+        progress_data, progress_path = self._read_pipeline_progress(img_path)
+        self._pipeline_progress_path = progress_path
+        if progress_data and progress_data.get("status") != "complete":
+            self._apply_pipeline_progress(progress_data)
+            self.append_log(f"[Pipeline Resume] Loaded checkpoint: {progress_path}")
+            self.progress_updated.emit(70 if (self._pipeline_ai_json_path or self._pipeline_math_json_path) else 5)
+        elif progress_data and progress_data.get("status") == "complete":
+            self._apply_pipeline_progress(progress_data)
+            pdf_path = progress_data.get("pdf", {}).get("path", "")
+            if pdf_path and os.path.exists(pdf_path):
+                self.append_log(f"[Pipeline Resume] Completed report already exists: {pdf_path}")
+                self.progress_updated.emit(100)
+                self.elapsed_updated.emit(f"Analysis time: {self._format_elapsed(self._pipeline_elapsed_seconds)}")
+                return
+
         self.analyse_btn.setEnabled(False)
         self.pause_btn.setEnabled(True)
         self.stop_btn.setEnabled(True)
+        self.progress_updated.emit(5)
+        self._pipeline_started_at = time.monotonic() - self._pipeline_elapsed_seconds
+        self._pipeline_timer.start(1000)
+        self._write_pipeline_progress("running")
 
-        if is_cloud:
+        prompt = (
+            "Analyse only the visible text, script, ancient text, glyphs, symbols, marks, and letter-like forms in this image. "
+            "Do not translate unless a transcription is visibly supported. Do not identify unrelated artifact details except where they affect script extraction. "
+            "Return structured extraction data with these headings:\n"
+            "VISIBLE SCRIPT DETECTION:\n"
+            "GLYPH / CHARACTER CANDIDATES:\n"
+            "TRANSCRIPTION IF VISIBLE:\n"
+            "WRITING SYSTEM CLUES:\n"
+            "DAMAGED OR UNCERTAIN STROKES:\n"
+            "CLEANING / SEGMENTATION NOTES:\n"
+            "CONFIDENCE:"
+        )
+
+        need_geometry = False
+        need_ai = not (self._pipeline_ai_json_path and os.path.exists(self._pipeline_ai_json_path))
+
+        self._geometry_analysis_worker = None
+
+        if not need_ai:
+            self._image_analysis_worker = None
+            self.append_log(f"[Pipeline Resume] Reusing AI extraction: {self._pipeline_ai_json_path}")
+            if not need_geometry:
+                self.progress_updated.emit(100)
+                self._notify_pipeline_complete()
+                return
+        elif is_cloud:
             api_key = self.get_gemini_api_key()
             if not api_key:
-                self.analyse_btn.setEnabled(True)
-                self.pause_btn.setEnabled(False)
-                self.stop_btn.setEnabled(False)
+                QMessageBox.critical(self, "Cloud AI Not Set Up", "No cloud API key is configured.")
+                self._finish_pipeline_controls_after_error()
                 return
             model_name = self.cloud_model_combo.currentText().strip()
             self._image_analysis_worker = GeminiImageAnalysisWorker(model_name, prompt, api_key, [img_path])
             self._image_analysis_worker.output_ready.connect(self._append_analysis_chunk)
             self._image_analysis_worker.finished_signal.connect(self._finished_image_analysis)
+            self._image_analysis_worker.finished.connect(
+                lambda worker=self._image_analysis_worker: self._cleanup_image_analysis_worker(worker)
+            )
+            self._image_analysis_started_at = time.monotonic()
+            self._image_analysis_timeout_timer.start(self._image_analysis_timeout_ms)
             self._image_analysis_worker.start()
         else:
             active_model = CURRENT_SETTINGS.get("active_model", "")
             if not active_model or active_model.startswith("gemini:"):
-                self.analyse_btn.setEnabled(True)
-                self.pause_btn.setEnabled(False)
-                self.stop_btn.setEnabled(False)
+                QMessageBox.critical(self, "Local AI Not Set Up", "No valid local model is targeted.")
+                self._finish_pipeline_controls_after_error()
                 return
             base_url = self.ollama_url_input.text().strip()
             self._image_analysis_worker = LocalImageAnalysisWorker(base_url, active_model, prompt, [img_path])
             self._image_analysis_worker.chunk_ready.connect(self._append_analysis_chunk)
             self._image_analysis_worker.finished_signal.connect(self._finished_image_analysis)
+            self._image_analysis_worker.finished.connect(
+                lambda worker=self._image_analysis_worker: self._cleanup_image_analysis_worker(worker)
+            )
+            self._image_analysis_started_at = time.monotonic()
+            self._image_analysis_timeout_timer.start(self._image_analysis_timeout_ms)
             self._image_analysis_worker.start()
 
-        self.append_log(f"[Analysis] Started analysis of: {os.path.basename(img_path)}")
+        if need_ai:
+            self.append_log(f"[Pipeline] AI extraction phase started: {os.path.basename(img_path)}")
 
     def _append_analysis_chunk(self, chunk):
         if self._analysis_stopped:
             return
         if self._analysis_paused:
             self._analysis_result_buffer += chunk
+            self._write_pipeline_progress("running")
             return
         self._analysis_chunks_received += 1
         pct = min(95, int((self._analysis_chunks_received / (self._analysis_chunks_received + 5)) * 100))
         self.progress_updated.emit(pct)
         self._analysis_result_buffer += chunk
+        self._write_pipeline_progress("running")
+
+    def _cleanup_image_analysis_worker(self, worker):
+        if self._image_analysis_worker is worker:
+            self._image_analysis_worker = None
+        worker.deleteLater()
+
+    def _cleanup_geometry_analysis_worker(self, worker):
+        if self._geometry_analysis_worker is worker:
+            self._geometry_analysis_worker = None
+        worker.deleteLater()
+
+    def _handle_image_analysis_timeout(self):
+        if not self._image_analysis_worker or not self._image_analysis_worker.isRunning():
+            return
+        elapsed = 0
+        if self._image_analysis_started_at is not None:
+            elapsed = int(time.monotonic() - self._image_analysis_started_at)
+        self._image_analysis_worker.terminate()
+        self._image_analysis_worker = None
+        self.append_log(
+            f"[Analysis Timeout] AI extraction did not respond after {elapsed or self._image_analysis_timeout_ms // 1000}s. "
+            "Stop and retry, or switch to a local model if the cloud service is slow."
+        )
+        self._analysis_total_chunks = 0
+        self._analysis_chunks_received = 0
+        self._analysis_saved_count = 0
+        self._image_analysis_started_at = None
+        self._write_pipeline_progress("timeout")
+        if not (self._geometry_analysis_worker and self._geometry_analysis_worker.isRunning()):
+            self._finish_pipeline_timer()
+            self.analyse_btn.setEnabled(True)
+            self.pause_btn.setEnabled(False)
+            self.stop_btn.setEnabled(False)
+            self.pause_btn.setText("⏸  Pause")
+            if self._pipeline_record_ids:
+                self.progress_updated.emit(100)
+                self._notify_pipeline_complete()
+            else:
+                self.progress_updated.emit(0)
 
     def _finished_image_analysis(self, success, err):
-        self.analyse_btn.setEnabled(True)
-        self.pause_btn.setEnabled(False)
-        self.stop_btn.setEnabled(False)
+        self._image_analysis_timeout_timer.stop()
+        self._image_analysis_started_at = None
+        if not (self._geometry_analysis_worker and self._geometry_analysis_worker.isRunning()):
+            self.analyse_btn.setEnabled(True)
+            self.pause_btn.setEnabled(False)
+            self.stop_btn.setEnabled(False)
         self.pause_btn.setText("⏸  Pause")
         self._analysis_paused = False
-        self._image_analysis_worker = None
         if success and not self._analysis_stopped:
             result = self._analysis_result_buffer or "Analysis completed"
-            img_path = self.img_selector_combo.currentData() or ""
+            img_path = self._current_pipeline_image_path or self.img_selector_combo.currentData() or ""
             inferred_ws = ""
             lower_res = result.lower()
             for ws in load_settings().get("writing_systems", []):
                 if ws.lower() in lower_res:
                     inferred_ws = ws
                     break
-            run_ai_query(
+            record_id = run_ai_insert(
                 "INSERT INTO ai_analysis_db (artifact_name, model_used, confidence_score, transcription, translation, notes, writing_system, letter_forms)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (os.path.basename(img_path), CURRENT_SETTINGS.get("active_model", ""), "N/A", result, "N/A",
-                 "Image Analysis", inferred_ws, ""))
-            self.progress_updated.emit(100)
-            self.analysis_completed.emit(True)
-            self.append_log("[Analysis] Completed and saved to AI database.")
+                 "AI script/text extraction phase", inferred_ws, ""))
+            ai_path = self._save_ai_extraction_result(img_path, result, inferred_ws)
+            self._pipeline_record_ids.append(record_id)
+            self._pipeline_ai_json_path = ai_path
+            self._write_pipeline_progress("running")
+            if not (self._geometry_analysis_worker and self._geometry_analysis_worker.isRunning()):
+                self.progress_updated.emit(100)
+                self._notify_pipeline_complete()
+            else:
+                self.progress_updated.emit(70)
+            self.append_log(f"[Pipeline] AI extraction saved: {ai_path}")
         elif not self._analysis_stopped:
             self.append_log(f"[Analysis Error] {err}")
             self.progress_updated.emit(0)
+            self._write_pipeline_progress("ai_error")
         self._analysis_total_chunks = 0
         self._analysis_chunks_received = 0
         self._analysis_saved_count = 0
+
+    def _finished_geometric_analysis(self, success, err, result):
+        img_path = self._current_pipeline_image_path or self.img_selector_combo.currentData() or ""
+        if success and not self._analysis_stopped:
+            self._last_math_analysis_result = result or {}
+            math_path = self._save_math_analysis_result(img_path, self._last_math_analysis_result)
+            report = self._last_math_analysis_result.get("report", {})
+            summary = report.get("summary", {}) if isinstance(report, dict) else {}
+            overlay_path = self._save_analyzed_area_overlay(img_path, report)
+            record_id = run_ai_insert(
+                "INSERT INTO ai_analysis_db (artifact_name, model_used, confidence_score, transcription, translation, notes, writing_system, letter_forms, "
+                "image_path, analyzed_area_image_path, glyphs_detected, total_glyph_area_px, avg_complexity_score, total_junction_points, total_endpoints, total_stroke_branches)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (os.path.basename(img_path), "Deterministic Geometric Analyzer", "Exact math", "N/A", "N/A",
+                 json.dumps(summary, indent=2), "Geometric script structure", json.dumps(report, indent=2),
+                 img_path, overlay_path, summary.get("glyphs_detected"), summary.get("total_glyph_area_px"),
+                 summary.get("avg_complexity_score"), summary.get("total_junction_points"),
+                 summary.get("total_endpoints"), summary.get("total_stroke_branches")))
+            self._pipeline_record_ids.append(record_id)
+            self._pipeline_math_json_path = math_path
+            self._pipeline_overlay_path = overlay_path
+            self._write_pipeline_progress("running")
+            if not (self._image_analysis_worker and self._image_analysis_worker.isRunning()):
+                self.analyse_btn.setEnabled(True)
+                self.pause_btn.setEnabled(False)
+                self.stop_btn.setEnabled(False)
+                self.progress_updated.emit(100)
+                self._notify_pipeline_complete()
+            else:
+                self.progress_updated.emit(70)
+            self.append_log(f"[Pipeline] Mathematical analysis saved: {math_path}")
+        elif not self._analysis_stopped:
+            self.append_log(f"[Geometric Error] {err}")
+            self._write_pipeline_progress("geometry_error")
+            if not (self._image_analysis_worker and self._image_analysis_worker.isRunning()):
+                self._finish_pipeline_timer()
+                self.analyse_btn.setEnabled(True)
+                self.pause_btn.setEnabled(False)
+                self.stop_btn.setEnabled(False)
+                self.progress_updated.emit(0)
+
+    def _finish_pipeline_controls_after_error(self):
+        self._image_analysis_timeout_timer.stop()
+        self._image_analysis_started_at = None
+        self._write_pipeline_progress("error")
+        self._finish_pipeline_timer()
+        self.analyse_btn.setEnabled(True)
+        self.pause_btn.setEnabled(False)
+        self.stop_btn.setEnabled(False)
+        self.pause_btn.setText("⏸  Pause")
+        self._analysis_paused = False
+        self.progress_updated.emit(0)
+
+    def _notify_pipeline_complete(self):
+        if self._pipeline_completion_notified:
+            return
+        self._pipeline_completion_notified = True
+        self._write_pipeline_progress("making_pdf")
+        pdf_path = self._generate_pipeline_pdf_report()
+        if not pdf_path:
+            pdf_path = self._generate_minimal_pipeline_pdf_report()
+        if pdf_path and self._pipeline_record_ids:
+            placeholders = ",".join("?" for _ in self._pipeline_record_ids)
+            run_ai_query(
+                f"UPDATE ai_analysis_db SET pdf_report_path=? WHERE id IN ({placeholders})",
+                tuple([pdf_path] + self._pipeline_record_ids)
+            )
+            self.append_log(f"[Pipeline] Human-readable PDF report saved: {pdf_path}")
+        self._finish_pipeline_timer()
+        if self._pipeline_progress_path:
+            try:
+                progress = {}
+                if os.path.exists(self._pipeline_progress_path):
+                    with open(self._pipeline_progress_path, "r", encoding="utf-8") as f:
+                        progress = json.load(f)
+                progress.update({
+                    "status": "complete",
+                    "updated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                    "elapsed_seconds": self._pipeline_elapsed_seconds,
+                    "record_ids": self._pipeline_record_ids,
+                })
+                progress["pdf"] = {"done": bool(pdf_path), "path": pdf_path}
+                with open(self._pipeline_progress_path, "w", encoding="utf-8") as f:
+                    json.dump(progress, f, indent=2)
+            except Exception as exc:
+                self.append_log(f"[Pipeline Progress Error] {exc}")
+        if pdf_path:
+            self.append_log(f"[Pipeline] Total analysis time: {self._format_elapsed(self._pipeline_elapsed_seconds)}")
+        else:
+            self.append_log("[Pipeline PDF Error] No PDF report could be created.")
+        self.analysis_completed.emit(True)
+
+    def _generate_pipeline_pdf_report(self):
+        img_path = self._current_pipeline_image_path or self.img_selector_combo.currentData() or ""
+        if not img_path:
+            return ""
+        report_dir = ensure_ai_report_folder()
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.splitext(os.path.basename(img_path))[0] or "image")
+        out_path = os.path.join(report_dir, f"{stamp}_{safe_name}_analysis_report.pdf")
+        ai_text = self._analysis_result_buffer.strip() or "No AI text extraction was returned."
+        report = self._last_math_analysis_result.get("report", {}) if isinstance(self._last_math_analysis_result, dict) else {}
+        summary = report.get("summary", {}) if isinstance(report, dict) else {}
+        per_glyph = report.get("per_glyph", []) if isinstance(report, dict) else []
+
+        try:
+            pdf = FPDF()
+            pdf.set_auto_page_break(auto=True, margin=14)
+            pdf.add_page()
+            self._pdf_title(pdf, "PANDU - Script Pipeline Analysis Report")
+            self._pdf_kv(pdf, "Image", os.path.basename(img_path))
+            self._pdf_kv(pdf, "Model", CURRENT_SETTINGS.get("active_model", ""))
+            self._pdf_kv(pdf, "Generated", datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            self._pdf_kv(pdf, "AI JSON", self._pipeline_ai_json_path or "Not available")
+            self._pdf_kv(pdf, "Geometry JSON", self._pipeline_math_json_path or "Not available")
+
+            self._pdf_section(pdf, "Human Explanation")
+            explanation = self._build_pipeline_human_explanation(ai_text, summary, per_glyph)
+            pdf.set_font("Helvetica", "", 10)
+            pdf.multi_cell(0, 5.5, pdf_safe_text(explanation))
+
+            self._pdf_section(pdf, "AI Script Extraction Logic")
+            pdf.set_font("Helvetica", "", 9)
+            pdf.multi_cell(0, 5, pdf_safe_text(ai_text[:5000]))
+
+            self._pdf_section(pdf, "Geometric Analysis Summary")
+            metric_rows = [
+                ("Glyphs detected", summary.get("glyphs_detected", "N/A")),
+                ("Total glyph area px", summary.get("total_glyph_area_px", "N/A")),
+                ("Average complexity", summary.get("avg_complexity_score", "N/A")),
+                ("Junction points", summary.get("total_junction_points", "N/A")),
+                ("Endpoints", summary.get("total_endpoints", "N/A")),
+                ("Stroke branches", summary.get("total_stroke_branches", "N/A")),
+                ("Branches per glyph", summary.get("branches_per_glyph", "N/A")),
+            ]
+            for label, value in metric_rows:
+                self._pdf_kv(pdf, label, value)
+            self._draw_pdf_metric_bars(pdf, metric_rows)
+
+            if self._pipeline_overlay_path and os.path.exists(self._pipeline_overlay_path):
+                self._pdf_section(pdf, "Graphical Analysed-Area Overlay")
+                max_w = 180
+                y = pdf.get_y()
+                if y > 185:
+                    pdf.add_page()
+                    y = pdf.get_y()
+                pdf.image(self._pipeline_overlay_path, x=15, y=y, w=max_w)
+                pdf.ln(105)
+
+            if per_glyph:
+                self._pdf_section(pdf, "Per-Glyph Geometry")
+                pdf.set_font("Helvetica", "", 8)
+                for item in per_glyph[:20]:
+                    structural = item.get("structural", {})
+                    morph = item.get("morphological", {})
+                    line = (
+                        f"Glyph {item.get('glyph')}: bbox={item.get('bbox')} | "
+                        f"junctions={structural.get('junctions')} endpoints={structural.get('endpoints')} "
+                        f"branches={structural.get('branches')} complexity={morph.get('complexity')} "
+                        f"area={morph.get('area')} solidity={morph.get('solidity')}"
+                    )
+                    pdf.multi_cell(0, 4.5, pdf_safe_text(line))
+
+            pdf.output(out_path)
+            return out_path
+        except Exception as exc:
+            self.append_log(f"[Pipeline PDF Error] {exc}")
+            return ""
+
+    def _generate_minimal_pipeline_pdf_report(self):
+        img_path = self._current_pipeline_image_path or self.img_selector_combo.currentData() or ""
+        if not img_path:
+            return ""
+        report_dir = ensure_ai_report_folder()
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.splitext(os.path.basename(img_path))[0] or "image")
+        out_path = os.path.join(report_dir, f"{stamp}_{safe_name}_analysis_report.pdf")
+        try:
+            pdf = FPDF()
+            pdf.set_auto_page_break(auto=True, margin=14)
+            pdf.add_page()
+            pdf.set_font("Helvetica", "B", 16)
+            pdf.cell(0, 10, pdf_safe_text("PANDU - Script Pipeline Analysis Report"), new_x="LMARGIN", new_y="NEXT", align="C")
+            pdf.ln(4)
+            pdf.set_font("Helvetica", "", 10)
+            lines = [
+                f"Image: {os.path.basename(img_path)}",
+                f"Model: {CURRENT_SETTINGS.get('active_model', '')}",
+                f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                f"Elapsed: {self._format_elapsed(self._pipeline_elapsed_seconds)}",
+                f"AI JSON: {self._pipeline_ai_json_path or 'Not available'}",
+                f"Geometry JSON: {self._pipeline_math_json_path or 'Not available'}",
+            ]
+            pdf.multi_cell(0, 5.5, pdf_safe_text("\n".join(lines)))
+            pdf.ln(4)
+            pdf.set_font("Helvetica", "B", 12)
+            pdf.cell(0, 8, "AI Script Extraction", new_x="LMARGIN", new_y="NEXT")
+            pdf.set_font("Helvetica", "", 9)
+            pdf.multi_cell(0, 5, pdf_safe_text((self._analysis_result_buffer or "No AI text extraction was returned.")[:7000]))
+            report = self._last_math_analysis_result.get("report", {}) if isinstance(self._last_math_analysis_result, dict) else {}
+            summary = report.get("summary", {}) if isinstance(report, dict) else {}
+            if summary:
+                pdf.ln(4)
+                pdf.set_font("Helvetica", "B", 12)
+                pdf.cell(0, 8, "Geometric Summary", new_x="LMARGIN", new_y="NEXT")
+                pdf.set_font("Helvetica", "", 9)
+                pdf.multi_cell(0, 5, pdf_safe_text(json.dumps(summary, indent=2)))
+            pdf.output(out_path)
+            self.append_log(f"[Pipeline] Minimal fallback PDF report saved: {out_path}")
+            return out_path
+        except Exception as exc:
+            self.append_log(f"[Pipeline PDF Error] Fallback failed: {exc}")
+            return ""
+
+    def _pdf_title(self, pdf, title):
+        pdf.set_font("Helvetica", "B", 16)
+        pdf.set_text_color(30, 30, 30)
+        pdf.cell(0, 10, pdf_safe_text(title), new_x="LMARGIN", new_y="NEXT", align="C")
+        pdf.ln(2)
+
+    def _pdf_section(self, pdf, title):
+        if pdf.get_y() > 250:
+            pdf.add_page()
+        pdf.ln(4)
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.set_text_color(45, 85, 130)
+        pdf.cell(0, 8, pdf_safe_text(title), new_x="LMARGIN", new_y="NEXT")
+        pdf.set_draw_color(45, 85, 130)
+        pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+        pdf.ln(3)
+        pdf.set_text_color(30, 30, 30)
+
+    def _pdf_kv(self, pdf, label, value):
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.set_text_color(80, 80, 80)
+        pdf.cell(44, 5.5, pdf_safe_text(f"{label}:"))
+        pdf.set_font("Helvetica", "", 9)
+        pdf.set_text_color(30, 30, 30)
+        pdf.multi_cell(0, 5.5, pdf_safe_text(value))
+
+    def _build_pipeline_human_explanation(self, ai_text, summary, per_glyph):
+        glyph_count = summary.get("glyphs_detected", len(per_glyph) if per_glyph else "unknown")
+        complexity = summary.get("avg_complexity_score", "unknown")
+        junctions = summary.get("total_junction_points", "unknown")
+        endpoints = summary.get("total_endpoints", "unknown")
+        branches = summary.get("total_stroke_branches", "unknown")
+        return (
+            "Pandu analysed this image in two cooperating phases. First, the AI extraction phase read the visible "
+            "marks as possible script, letter-like forms, damaged strokes, and writing-system clues. Second, the "
+            "deterministic geometry phase treated the image as shapes: it isolated glyph candidates, skeletonized "
+            "their strokes, and measured structural features such as junctions, endpoints, branch count, area, and "
+            "complexity.\n\n"
+            f"The geometric phase found {glyph_count} glyph candidate(s). Their average complexity score was "
+            f"{complexity}, with {junctions} junction point(s), {endpoints} endpoint(s), and {branches} stroke "
+            "branch(es). High junction and branch counts usually indicate more complex letterforms or overlapping "
+            "strokes; low counts usually indicate simple marks, erosion, or incomplete characters.\n\n"
+            "The final interpretation is based on agreement between what the AI described in natural language and "
+            "what the geometry measured in the image. If the AI mentions script-like strokes and the geometry also "
+            "finds coherent glyph regions with measurable skeleton structure, Pandu treats the analysis as stronger. "
+            "If either phase is weak, the report should be read as uncertain and checked by a human specialist."
+        )
+
+    def _draw_pdf_metric_bars(self, pdf, metric_rows):
+        numeric_rows = []
+        for label, value in metric_rows:
+            try:
+                numeric_rows.append((label, float(value)))
+            except (TypeError, ValueError):
+                pass
+        if not numeric_rows:
+            return
+        pdf.ln(2)
+        max_value = max(value for _, value in numeric_rows) or 1
+        pdf.set_font("Helvetica", "", 8)
+        for label, value in numeric_rows:
+            if pdf.get_y() > 260:
+                pdf.add_page()
+            pdf.set_text_color(60, 60, 60)
+            pdf.cell(46, 5, pdf_safe_text(label[:24]))
+            bar_w = max(2, min(105, (value / max_value) * 105))
+            pdf.set_fill_color(70, 130, 180)
+            pdf.cell(bar_w, 5, "", fill=True)
+            pdf.cell(3, 5, "")
+            pdf.set_text_color(30, 30, 30)
+            pdf.cell(0, 5, pdf_safe_text(value), new_x="LMARGIN", new_y="NEXT")
+
+    def _save_ai_extraction_result(self, img_path, result, writing_system):
+        ai_dir, _ = ensure_ai_pipeline_folders()
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.splitext(os.path.basename(img_path))[0] or "image")
+        out_path = os.path.join(ai_dir, f"{stamp}_{safe_name}_ai_extraction.json")
+        data = {
+            "image_path": img_path,
+            "model_used": CURRENT_SETTINGS.get("active_model", ""),
+            "writing_system_detected": writing_system,
+            "phase": "AI Clean & Extract",
+            "result": result
+        }
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        return out_path
+
+    def _save_math_analysis_result(self, img_path, result):
+        _, math_dir = ensure_ai_pipeline_folders()
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.splitext(os.path.basename(img_path))[0] or "image")
+        out_path = os.path.join(math_dir, f"{stamp}_{safe_name}_geometric_analysis.json")
+        data = {
+            "image_path": img_path,
+            "phase": "Geometric Hard Math",
+            "pipeline": "[Raw Image/3D Scan] -> [Perfect Vector Skeleton] -> [Scientific Analysis]",
+            "result": make_json_safe(result)
+        }
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        return out_path
+
+    def _save_analyzed_area_overlay(self, img_path, report):
+        _, math_dir = ensure_ai_pipeline_folders()
+        img = cv2.imread(img_path)
+        if img is None:
+            return ""
+        overlay = img.copy()
+        per_glyph = report.get("per_glyph", []) if isinstance(report, dict) else []
+        for item in per_glyph:
+            bbox = item.get("bbox", [])
+            if len(bbox) != 4:
+                continue
+            x, y, w, h = [int(v) for v in bbox]
+            roi = img[y:y + h, x:x + w]
+            polygon_drawn = False
+            if roi.size:
+                gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                blur = cv2.GaussianBlur(gray, (3, 3), 0)
+                _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+                contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                contours = [c for c in contours if cv2.contourArea(c) > 8]
+                if contours:
+                    merged = np.vstack(contours)
+                    hull = cv2.convexHull(merged)
+                    epsilon = max(2.0, 0.015 * cv2.arcLength(hull, True))
+                    poly = cv2.approxPolyDP(hull, epsilon, True)
+                    poly[:, 0, 0] += x
+                    poly[:, 0, 1] += y
+                    cv2.polylines(overlay, [poly], True, (255, 255, 255), 3, cv2.LINE_AA)
+                    polygon_drawn = True
+                    skeleton = medial_axis(thresh > 0).astype(np.uint8) * 255
+                    ys, xs = np.where(skeleton > 0)
+                    if len(xs) > 0:
+                        overlay[y + ys, x + xs] = (255, 255, 0)
+                if not polygon_drawn:
+                    pts = np.array([[[x, y]], [[x + w, y]], [[x + w, y + h]], [[x, y + h]]], dtype=np.int32)
+                    cv2.polylines(overlay, [pts], True, (255, 255, 255), 3, cv2.LINE_AA)
+
+            center = (x + w // 2, y + h // 2)
+            cv2.drawMarker(overlay, center, (0, 255, 255), cv2.MARKER_CROSS, 14, 2)
+            structural = item.get("structural", {})
+            morph = item.get("morphological", {})
+            cv2.rectangle(overlay, (x, y), (x + w, y + h), (60, 180, 255), 1, cv2.LINE_AA)
+            label = f"G{item.get('glyph', '')}"
+            metrics = (
+                f"{label} J{structural.get('junctions', 0)} "
+                f"E{structural.get('endpoints', 0)} "
+                f"B{structural.get('branches', 0)} "
+                f"C{morph.get('complexity', 0)}"
+            )
+            text_y = max(18, y - 8)
+            cv2.putText(overlay, metrics, (x, text_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.putText(overlay, metrics, (x, text_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+        summary = report.get("summary", {}) if isinstance(report, dict) else {}
+        summary_text = (
+            f"Geometric text analysis: glyphs={summary.get('glyphs_detected', len(per_glyph))} "
+            f"area={summary.get('total_glyph_area_px', 'N/A')} "
+            f"avg_complexity={summary.get('avg_complexity_score', 'N/A')}"
+        )
+        cv2.rectangle(overlay, (8, 8), (min(img.shape[1] - 8, 760), 42), (0, 0, 0), -1)
+        cv2.putText(overlay, summary_text, (16, 31),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.splitext(os.path.basename(img_path))[0] or "image")
+        out_path = os.path.join(math_dir, f"{stamp}_{safe_name}_analyzed_areas.png")
+        cv2.imwrite(out_path, overlay)
+        return out_path
 
     def submit_embedded_cloud_chat(self):
         text = self.cloud_msg_input.toPlainText().strip()
@@ -1717,9 +2662,6 @@ class AIAnalysisPage(QWidget):
         if success:
             full_response = "".join(self._gemini_parts)
             self.gemini_chat_history.append(f"AI: {full_response}")
-            run_ai_query(
-                "INSERT INTO ai_analysis_db (artifact_name, model_used, confidence_score, transcription, translation, notes, writing_system, letter_forms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                ("Cloud Conversation Fragment", CURRENT_SETTINGS.get("active_model", ""), "N/A", "N/A", "N/A", full_response, "", ""))
         else:
             self.append_log(f"[Cloud Chat Error] {engine_msg}")
             if self._current_cloud_ai_bubble is not None:
@@ -1765,9 +2707,6 @@ class AIAnalysisPage(QWidget):
         if success:
             full_response = "".join(self._local_response_chunks)
             self._local_history.append({"role": "assistant", "content": full_response})
-            run_ai_query(
-                "INSERT INTO ai_analysis_db (artifact_name, model_used, confidence_score, transcription, translation, notes, writing_system, letter_forms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                ("Local Conversation Fragment", CURRENT_SETTINGS.get("active_model", ""), "N/A", "N/A", "N/A", full_response, "", ""))
         else:
             self.append_log(f"[Local Chat Error] {err}")
             if self._current_local_ai_bubble is not None:
@@ -1828,21 +2767,103 @@ class AIDatabasePage(QWidget):
         top.addWidget(sep); top.addWidget(clear_all); top.addStretch()
         layout.addLayout(top)
         self.table = QTableWidget()
-        self.table.setColumnCount(9)
-        self.table.setHorizontalHeaderLabels(["ID", "Artifact Name", "Model Used", "Confidence Score", "Transcription", "Translation", "Notes", "Writing System", "Actions"])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table.setColumnCount(17)
+        self.table.setHorizontalHeaderLabels([
+            "Area", "PDF", "ID", "Artifact Name", "Model Used", "Confidence Score",
+            "Glyphs", "Area px", "Complexity", "Junctions", "Endpoints", "Branches",
+            "Transcription", "Translation", "Notes", "Writing System", "Actions"
+        ])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(12, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(14, QHeaderView.ResizeMode.Stretch)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         layout.addWidget(self.table)
         self.load_data()
+
+    def find_pdf_report_for_artifact(self, artifact_name):
+        report_dir = ensure_ai_report_folder()
+        if not os.path.isdir(report_dir):
+            return ""
+        base = os.path.splitext(os.path.basename(artifact_name or ""))[0] or "image"
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", base)
+        matches = []
+        try:
+            for name in os.listdir(report_dir):
+                if not name.lower().endswith(".pdf"):
+                    continue
+                if safe_name and safe_name not in name:
+                    continue
+                path = os.path.join(report_dir, name)
+                if os.path.isfile(path):
+                    matches.append(path)
+        except OSError:
+            return ""
+        if not matches:
+            return ""
+        return max(matches, key=lambda p: os.path.getmtime(p))
+
     def load_data(self):
         self.table.setRowCount(0)
         rows = run_ai_query(
-            "SELECT id, artifact_name, model_used, confidence_score, transcription, translation, notes, writing_system, letter_forms"
+            "SELECT id, artifact_name, model_used, confidence_score, transcription, translation, notes, writing_system, letter_forms, "
+            "image_path, analyzed_area_image_path, glyphs_detected, total_glyph_area_px, avg_complexity_score, "
+            "total_junction_points, total_endpoints, total_stroke_branches, pdf_report_path"
             " FROM ai_analysis_db ORDER BY id DESC", fetch=True)
         for row in rows:
             r_idx = self.table.rowCount(); self.table.insertRow(r_idx)
-            display_vals = [row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7]]
-            for i, val in enumerate(display_vals):
+            overlay_path = row[10] if len(row) > 10 else ""
+            image_path = row[9] if len(row) > 9 else ""
+            pdf_path = row[17] if len(row) > 17 else ""
+            if not (pdf_path and os.path.exists(pdf_path)):
+                pdf_path = self.find_pdf_report_for_artifact(row[1])
+            area_btn = QPushButton()
+            area_btn.setFixedSize(34, 28)
+            area_btn.setToolTip("Show AI analysed text areas")
+            icon_source = overlay_path if overlay_path and os.path.exists(overlay_path) else image_path
+            if icon_source and os.path.exists(icon_source):
+                area_btn.setIcon(QIcon(icon_source))
+                area_btn.setIconSize(QSize(26, 22))
+                area_btn.clicked.connect(lambda checked, p=icon_source: self.view_analyzed_area(p))
+            else:
+                area_btn.setText("□")
+                area_btn.setEnabled(False)
+            self.table.setCellWidget(r_idx, 0, area_btn)
+
+            pdf_btn = QPushButton()
+            pdf_btn.setFixedSize(44, 28)
+            pdf_btn.setToolTip("Open human-readable PDF analysis report")
+            pdf_icon = QIcon.fromTheme("application-pdf")
+            if pdf_icon.isNull():
+                pdf_icon = QIcon.fromTheme("x-office-document")
+            if not pdf_icon.isNull():
+                pdf_btn.setIcon(pdf_icon)
+                pdf_btn.setIconSize(QSize(22, 22))
+            else:
+                pdf_btn.setText("PDF")
+            pdf_btn.setStyleSheet(
+                "QPushButton { background: #1a0a0a; border: 1px solid #663333; color: #ffdddd; font-size: 10px; font-weight: bold; }"
+                "QPushButton:disabled { background: #090909; border-color: #181818; color: #333333; }"
+            )
+            if pdf_path and os.path.exists(pdf_path):
+                pdf_btn.setToolTip(f"Open PDF report:\n{pdf_path}")
+                pdf_btn.clicked.connect(lambda checked, p=pdf_path: self.open_pdf_report(p))
+            else:
+                pdf_btn.setToolTip("No PDF report was found for this record")
+                pdf_btn.setEnabled(False)
+            self.table.setCellWidget(r_idx, 1, pdf_btn)
+
+            display_vals = [
+                row[0], row[1], row[2], row[3],
+                row[11] if len(row) > 11 else "",
+                row[12] if len(row) > 12 else "",
+                row[13] if len(row) > 13 else "",
+                row[14] if len(row) > 14 else "",
+                row[15] if len(row) > 15 else "",
+                row[16] if len(row) > 16 else "",
+                row[4], row[5], row[6], row[7]
+            ]
+            for i, val in enumerate(display_vals, start=2):
                 self.table.setItem(r_idx, i, QTableWidgetItem(str(val) if val is not None else ""))
             act = QWidget(); a_lay = QHBoxLayout(act); a_lay.setContentsMargins(2, 2, 2, 2)
             e_btn = QPushButton("Edit")
@@ -1850,7 +2871,33 @@ class AIDatabasePage(QWidget):
             e_btn.clicked.connect(lambda checked, r=row: self.edit_row(r))
             d_btn.clicked.connect(lambda checked, i=row[0]: self.delete_row(i))
             a_lay.addWidget(e_btn); a_lay.addWidget(d_btn)
-            self.table.setCellWidget(r_idx, 8, act)
+            self.table.setCellWidget(r_idx, 16, act)
+    def open_pdf_report(self, path):
+        if not path or not os.path.exists(path):
+            QMessageBox.warning(self, "PDF Missing", "The PDF report could not be found.")
+            return
+        if not open_file_with_system_app(path):
+            QMessageBox.warning(self, "Open PDF", f"Could not open PDF viewer for:\n{path}")
+    def view_analyzed_area(self, path):
+        if not path or not os.path.exists(path):
+            QMessageBox.warning(self, "Image Missing", "The analysed-area image could not be found.")
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle("AI Analysed Text Areas")
+        dlg.resize(900, 700)
+        layout = QVBoxLayout(dlg)
+        lbl = QLabel()
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pix = QPixmap(path)
+        if not pix.isNull():
+            lbl.setPixmap(pix.scaled(860, 640, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        else:
+            lbl.setText("Could not load analysed-area image.")
+        layout.addWidget(lbl)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.accept)
+        layout.addWidget(close_btn)
+        dlg.exec()
     def edit_row(self, row):
         d = EditAIDialog(row, self)
         if d.exec() == QDialog.DialogCode.Accepted:
@@ -1888,6 +2935,270 @@ class AIDatabasePage(QWidget):
                                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
             run_ai_query("DELETE FROM ai_analysis_db")
             self.load_data()
+
+# ── Geometric Analysis Page ──────────────────────────────────────────────────
+
+class GeometricAnalysisPage(QWidget):
+    progress_updated = pyqtSignal(int)
+    analysis_completed = pyqtSignal(bool)
+
+    def __init__(self):
+        super().__init__()
+        self._worker = None
+        self._glyphs = []
+        self._image_path = ""
+        self._artifact_name = ""
+        self.setup_ui()
+        self.refresh_library_images()
+        self.load_saved_glyphs()
+
+    def _sec(self, text):
+        l = QLabel(text)
+        l.setStyleSheet("color: #383838; font-size: 9px; font-weight: bold; letter-spacing: 2px; margin-top: 6px;")
+        return l
+
+    def setup_ui(self):
+        root = QVBoxLayout(self)
+        root.setSpacing(10)
+        self.setStyleSheet("""
+            QWidget { background: #070707; color: #b0b0b0; font-family: 'Segoe UI', Arial; font-size: 12px; }
+            QLineEdit { background: #0f0f0f; border: 1px solid #252525; border-radius: 4px; padding: 5px 8px; color: #dddddd; }
+            QPushButton { background: #111111; border: 1px solid #282828; border-radius: 4px; padding: 5px 12px; color: #aaaaaa; font-weight: bold; }
+            QPushButton:hover { background: #181818; border-color: #404040; }
+            QPushButton:disabled { color: #282828; border-color: #151515; background: #0a0a0a; }
+            QComboBox { background: #0f0f0f; border: 1px solid #252525; border-radius: 4px; padding: 4px 8px; color: #cccccc; }
+            QTableWidget { background: #080808; border: 1px solid #1a1a1a; gridline-color: #1f1f1f; color: #cccccc; }
+            QHeaderView::section { background: #111111; color: #777777; border: 1px solid #1f1f1f; padding: 4px; }
+        """)
+
+        top = QHBoxLayout()
+        self.library_combo = QComboBox()
+        self.library_combo.setMinimumWidth(260)
+        refresh_btn = QPushButton("⟳")
+        refresh_btn.setFixedWidth(32)
+        refresh_btn.clicked.connect(self.refresh_library_images)
+        self.run_btn = QPushButton("Separate Glyphs")
+        self.run_btn.setStyleSheet("QPushButton { background: #0a1020; border: 1px solid #1a3060; color: #66aaff; }")
+        self.run_btn.clicked.connect(self.run_glyph_separation)
+        self.save_btn = QPushButton("Save Glyph Labels")
+        self.save_btn.setEnabled(False)
+        self.save_btn.setStyleSheet("QPushButton { background: #102010; border: 1px solid #255025; color: #aaffaa; }")
+        self.save_btn.clicked.connect(self.save_glyph_labels)
+        top.addWidget(QLabel("Library Image:"))
+        top.addWidget(self.library_combo, 1)
+        top.addWidget(refresh_btn)
+        top.addWidget(self.run_btn)
+        top.addWidget(self.save_btn)
+        root.addLayout(top)
+
+        self.status_label = QLabel("Ready.")
+        self.status_label.setStyleSheet("color: #666666; font-size: 10px;")
+        root.addWidget(self.status_label)
+
+        root.addWidget(self._sec("SEPARATED GLYPHS"))
+        self.glyph_table = QTableWidget()
+        self.glyph_table.setColumnCount(6)
+        self.glyph_table.setHorizontalHeaderLabels(["Glyph", "Glyph Name", "Modern Equivalent", "BBox", "Area", "Notes"])
+        self.glyph_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.glyph_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.glyph_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.glyph_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        self.glyph_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        root.addWidget(self.glyph_table, 3)
+
+        root.addWidget(self._sec("SAVED GLYPHS"))
+        self.saved_table = QTableWidget()
+        self.saved_table.setColumnCount(6)
+        self.saved_table.setHorizontalHeaderLabels(["ID", "Artifact", "Glyph", "Name", "Equivalent", "Created"])
+        self.saved_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.saved_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.saved_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.saved_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        root.addWidget(self.saved_table, 2)
+
+    def refresh_library_images(self):
+        current = self.library_combo.currentData()
+        self.library_combo.clear()
+        rows = run_query("SELECT id, name, image_path, writing_system FROM entries ORDER BY id DESC", fetch=True)
+        for entry_id, name, image_path, writing_system in rows:
+            if image_path and os.path.exists(image_path):
+                label = f"[{entry_id}] {name or os.path.basename(image_path)}"
+                if writing_system:
+                    label += f" - {writing_system}"
+                self.library_combo.addItem(label, userData=(entry_id, name or os.path.basename(image_path), image_path, writing_system or ""))
+        if current:
+            for i in range(self.library_combo.count()):
+                if self.library_combo.itemData(i) == current:
+                    self.library_combo.setCurrentIndex(i)
+                    break
+
+    def run_glyph_separation(self):
+        data = self.library_combo.currentData()
+        if not data:
+            QMessageBox.warning(self, "No Image", "Select a library image first.")
+            return
+        _, artifact_name, image_path, _ = data
+        if not image_path or not os.path.exists(image_path):
+            QMessageBox.warning(self, "Image Missing", "The selected library image could not be found.")
+            return
+        if self._worker and self._worker.isRunning():
+            return
+        self._image_path = image_path
+        self._artifact_name = artifact_name
+        self._glyphs = []
+        self.glyph_table.setRowCount(0)
+        self.run_btn.setEnabled(False)
+        self.save_btn.setEnabled(False)
+        self.status_label.setText("Separating glyphs...")
+        self.progress_updated.emit(10)
+        self._worker = GlyphSegmentationWorker(image_path)
+        self._worker.finished_signal.connect(self._on_glyph_separation_finished)
+        worker = self._worker
+        self._worker.finished.connect(lambda: worker.deleteLater())
+        self._worker.start()
+
+    def _on_glyph_separation_finished(self, success, err, result):
+        self.run_btn.setEnabled(True)
+        self._worker = None
+        if not success:
+            self.status_label.setText(f"Separation failed: {err}")
+            self.progress_updated.emit(0)
+            QMessageBox.critical(self, "Geometric Analysis", f"Could not separate glyphs:\n{err}")
+            return
+        self._glyphs = result.get("glyphs", []) if isinstance(result, dict) else []
+        self.populate_glyph_table()
+        self.save_btn.setEnabled(bool(self._glyphs))
+        self.status_label.setText(f"Separated {len(self._glyphs)} glyph candidate(s). Add labels, then save.")
+        self.progress_updated.emit(100)
+        self.analysis_completed.emit(True)
+
+    def populate_glyph_table(self):
+        self.glyph_table.setRowCount(0)
+        for glyph in self._glyphs:
+            row = self.glyph_table.rowCount()
+            self.glyph_table.insertRow(row)
+            glyph_img = QLabel()
+            glyph_img.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            preview_path = self._write_glyph_preview(glyph, preview=True)
+            pix = QPixmap(preview_path) if preview_path else QPixmap()
+            if not pix.isNull():
+                glyph_img.setPixmap(pix.scaled(56, 56, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+            else:
+                glyph_img.setText(f"G{glyph.get('index', row)}")
+            self.glyph_table.setCellWidget(row, 0, glyph_img)
+
+            name_input = QLineEdit()
+            name_input.setPlaceholderText("Glyph name")
+            equiv_input = QLineEdit()
+            equiv_input.setPlaceholderText("Modern equivalent")
+            notes_input = QLineEdit()
+            notes_input.setPlaceholderText("Notes")
+            self.glyph_table.setCellWidget(row, 1, name_input)
+            self.glyph_table.setCellWidget(row, 2, equiv_input)
+            self.glyph_table.setItem(row, 3, QTableWidgetItem(str(glyph.get("bbox", ""))))
+            self.glyph_table.setItem(row, 4, QTableWidgetItem(str(glyph.get("area", ""))))
+            self.glyph_table.setCellWidget(row, 5, notes_input)
+            self.glyph_table.setRowHeight(row, 64)
+
+    def _write_glyph_preview(self, glyph, preview=False):
+        glyph_dir = ensure_ai_glyph_folder()
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.splitext(os.path.basename(self._image_path))[0] or "image")
+        prefix = "preview" if preview else "glyph"
+        out_path = os.path.join(glyph_dir, f"{stamp}_{safe_name}_{prefix}_{glyph.get('index', 0)}.png")
+        glyph_gray = glyph.get("gray")
+        if isinstance(glyph_gray, np.ndarray):
+            cv2.imwrite(out_path, glyph_gray)
+            return out_path
+        bbox = glyph.get("bbox", ())
+        img = cv2.imread(self._image_path)
+        if img is not None and len(bbox) == 4:
+            x, y, w, h = [int(v) for v in bbox]
+            crop = img[y:y + h, x:x + w]
+            if crop.size:
+                cv2.imwrite(out_path, crop)
+                return out_path
+        return ""
+
+    def save_glyph_labels(self):
+        if not self._glyphs or not self._image_path:
+            QMessageBox.warning(self, "No Glyphs", "Run glyph separation before saving.")
+            return
+        data = self.library_combo.currentData()
+        writing_system = data[3] if data and len(data) > 3 else ""
+        saved = 0
+        label_data = []
+        for row, glyph in enumerate(self._glyphs):
+            name_widget = self.glyph_table.cellWidget(row, 1)
+            equiv_widget = self.glyph_table.cellWidget(row, 2)
+            notes_widget = self.glyph_table.cellWidget(row, 5)
+            glyph_name = name_widget.text().strip() if isinstance(name_widget, QLineEdit) else ""
+            modern_equiv = equiv_widget.text().strip() if isinstance(equiv_widget, QLineEdit) else ""
+            notes = notes_widget.text().strip() if isinstance(notes_widget, QLineEdit) else ""
+            glyph_path = self._write_glyph_preview(glyph, preview=False)
+            bbox = json.dumps(glyph.get("bbox", []))
+            run_ai_insert(
+                "INSERT INTO ai_glyphs (artifact_name, source_image_path, glyph_image_path, glyph_index, bbox, glyph_name, modern_equivalent, writing_system, notes, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    self._artifact_name, self._image_path, glyph_path, glyph.get("index", row), bbox,
+                    glyph_name, modern_equiv, writing_system, notes,
+                    datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                )
+            )
+            label_data.append({
+                "glyph_index": glyph.get("index", row),
+                "bbox": glyph.get("bbox", []),
+                "glyph_name": glyph_name,
+                "modern_equivalent": modern_equiv,
+                "glyph_image_path": glyph_path,
+                "notes": notes,
+            })
+            saved += 1
+        run_ai_insert(
+            "INSERT INTO ai_analysis_db (artifact_name, model_used, confidence_score, transcription, translation, notes, writing_system, letter_forms, image_path, glyphs_detected)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                self._artifact_name,
+                "Geometric Glyph Separator",
+                "Deterministic segmentation",
+                "Glyphs separated from library image",
+                "",
+                f"Saved {saved} individual glyph record(s) from geometric analysis.",
+                writing_system,
+                json.dumps(label_data, indent=2),
+                self._image_path,
+                saved,
+            )
+        )
+        self.status_label.setText(f"Saved {saved} glyph record(s) to the AI database.")
+        self.load_saved_glyphs()
+        QMessageBox.information(self, "Glyphs Saved", f"Saved {saved} glyph record(s) to the AI database.")
+
+    def load_saved_glyphs(self):
+        self.saved_table.setRowCount(0)
+        rows = run_ai_query(
+            "SELECT id, artifact_name, glyph_image_path, glyph_name, modern_equivalent, created_at "
+            "FROM ai_glyphs ORDER BY id DESC LIMIT 100",
+            fetch=True
+        )
+        for row_data in rows:
+            row = self.saved_table.rowCount()
+            self.saved_table.insertRow(row)
+            self.saved_table.setItem(row, 0, QTableWidgetItem(str(row_data[0])))
+            self.saved_table.setItem(row, 1, QTableWidgetItem(row_data[1] or ""))
+            glyph_label = QLabel()
+            glyph_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            pix = QPixmap(row_data[2] or "")
+            if not pix.isNull():
+                glyph_label.setPixmap(pix.scaled(42, 42, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+            else:
+                glyph_label.setText("Glyph")
+            self.saved_table.setCellWidget(row, 2, glyph_label)
+            self.saved_table.setItem(row, 3, QTableWidgetItem(row_data[3] or ""))
+            self.saved_table.setItem(row, 4, QTableWidgetItem(row_data[4] or ""))
+            self.saved_table.setItem(row, 5, QTableWidgetItem(row_data[5] or ""))
+            self.saved_table.setRowHeight(row, 48)
 
 # ── Training Worker ─────────────────────────────────────────────────────────
 
@@ -2708,6 +4019,721 @@ class BarChartWidget(QWidget):
         painter.end()
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# ── SCIENTIFIC GLYPH ANALYZER (Two-Phase Pipeline) ──────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Pipeline:
+#   [Raw Image/3D Scan] 
+#     → (Phase 1: CV Layer — denoise, threshold, segment, inpaint, clean)
+#     → [Perfect Vector Skeleton]
+#     → (Phase 2: Geometric Layer — skeletonize, graph theory, Procrustes, Hausdorff)
+#     → [Scientific Analysis Report]
+#
+
+class ScientificGlyphAnalyzer:
+    """Pure scientific analysis of ancient glyphs using deterministic math.
+    
+    Phase 1 (AI/CV Layer): OpenCV-based cleaning, segmentation, and extraction.
+    Phase 2 (Geometric Layer): Medial axis skeletonization + graph theory + Procrustes.
+    """
+    
+    def __init__(self):
+        self._last_skeleton = None
+        self._last_contours = None
+        self._last_glyph_graphs = []
+        self._last_report = {}
+        
+    # ── Phase 1: AI/CV Layer (Cleaning & Extraction) ──────────────────────
+    
+    def phase1_clean_and_extract(self, image_path):
+        """Phase 1: Clean the image and extract glyph regions.
+        
+        Uses OpenCV for:
+        - Adaptive thresholding (handles inconsistent lighting)
+        - Morphological closing (heals broken strokes)
+        - Connected component analysis for character segmentation
+        - Contour extraction for each detected glyph
+        
+        Returns dict with preprocessed image, glyph bounding boxes, contours.
+        """
+        img = cv2.imread(image_path)
+        if img is None:
+            raise ValueError(f"Cannot read image: {image_path}")
+        
+        result = {
+            "original_shape": img.shape,
+            "glyphs": [],
+            "preprocessed_visual": None,
+            "segmentation_count": 0
+        }
+        
+        # Step 1: Convert to grayscale
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # Step 2: CLAHE (Contrast Limited Adaptive Histogram Equalization)
+        # This handles inconsistent lighting like shadows on stone tablets
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+        
+        # Step 3: Adaptive thresholding (OTSU fallback)
+        # Adaptive threshold handles varying background intensity
+        binary = cv2.adaptiveThreshold(
+            enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV, 11, 2
+        )
+        
+        # Step 4: Morphological operations to heal broken strokes
+        # Closing: dilate then erode — connects broken parts of characters
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel_close, iterations=1)
+        
+        # Opening: erode then dilate — removes small noise specks
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+        cleaned = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel_open, iterations=1)
+        
+        # Step 5: Connected component analysis to find individual glyphs
+        num_labels, labels_im, stats, centroids = cv2.connectedComponentsWithStats(
+            cleaned, connectivity=8
+        )
+        
+        # Filter small components (noise) and large components (background blobs)
+        min_area = max(20, int(img.shape[0] * img.shape[1] * 0.0005))
+        max_area = int(img.shape[0] * img.shape[1] * 0.5)
+        
+        # Extract contours for each valid glyph
+        contours, hierarchy = cv2.findContours(
+            cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        
+        valid_glyphs = []
+        for i, cnt in enumerate(contours):
+            area = cv2.contourArea(cnt)
+            if area < min_area or area > max_area:
+                continue
+            
+            x, y, w, h = cv2.boundingRect(cnt)
+            
+            # Extract the glyph sub-image from cleaned binary
+            glyph_mask = cleaned[y:y+h, x:x+w]
+            
+            # Extract the glyph from the original grayscale
+            glyph_gray = gray[y:y+h, x:x+w]
+            
+            # Calculate aspect ratio to filter non-glyph shapes
+            aspect_ratio = float(w) / max(h, 1)
+            if aspect_ratio > 10 or aspect_ratio < 0.1:
+                continue  # Too stretched to be a character
+            
+            # Calculate solidity (area / convex hull area)
+            hull = cv2.convexHull(cnt)
+            hull_area = cv2.contourArea(hull)
+            solidity = float(area) / max(hull_area, 1) if hull_area > 0 else 0
+            
+            valid_glyphs.append({
+                "index": len(valid_glyphs),
+                "bbox": (int(x), int(y), int(w), int(h)),
+                "center": (int(x + w/2), int(y + h/2)),
+                "area": int(area),
+                "aspect_ratio": float(f"{aspect_ratio:.3f}"),
+                "solidity": float(f"{solidity:.3f}"),
+                "contour_points": cnt,
+                "mask": glyph_mask,
+                "gray": glyph_gray,
+                "contour_simplified": cv2.approxPolyDP(cnt, 0.02 * cv2.arcLength(cnt, True), True)
+            })
+        
+        result["glyphs"] = valid_glyphs
+        result["segmentation_count"] = len(valid_glyphs)
+        result["preprocessed_binary"] = cleaned
+        result["preprocessed_enhanced"] = enhanced
+        
+        # Create visualization (original with bounding boxes drawn)
+        vis_img = img.copy()
+        for g in valid_glyphs:
+            x, y, w, h = g["bbox"]
+            cv2.rectangle(vis_img, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            cv2.putText(vis_img, str(g["index"]), (x, y - 5),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        
+        result["visualization"] = vis_img
+        self._last_contours = contours
+        return result
+    
+    # ── Phase 2: Geometric Layer (Scientific Measurement) ─────────────────
+    
+    def phase2_geometric_analysis(self, phase1_result):
+        """Phase 2: Deterministic geometric analysis of extracted glyphs.
+        
+        Steps:
+        1. Medial Axis Transform (skeletonization) for each glyph
+        2. Graph theory: nodes at crossings/endpoints, edges as strokes
+        3. Branch counting, angle measurement, junction detection
+        4. Procrustes alignment for shape comparison
+        5. Hausdorff distance metrics
+        
+        Returns dict with structural metrics per glyph and overall statistics.
+        """
+        analysis = {
+            "glyph_metrics": [],
+            "overall_report": {},
+            "skeletons_visual": None,
+            "graph_visual": None
+        }
+        
+        glyphs = phase1_result.get("glyphs", [])
+        if not glyphs:
+            return analysis
+        
+        all_graphs = []
+        combined_skeleton = None
+        h, w = phase1_result["original_shape"][:2]
+        
+        for glyph in glyphs:
+            mask = glyph["mask"]
+            
+            # Step 1: Medial Axis Transform (skeletonization)
+            # This creates a 1-pixel-wide skeleton capturing the "movement of the scribe's hand"
+            skeleton = medial_axis(mask > 0)
+            skeleton_uint8 = (skeleton * 255).astype(np.uint8)
+            
+            # Step 2: Skeleton pruning (remove single-pixel branches from noise)
+            pruned = self._prune_skeleton(skeleton_uint8, min_branch_length=3)
+            
+            # Step 3: Detect junction points and endpoints
+            junctions, endpoints, branch_points = self._analyze_skeleton_topology(pruned)
+            
+            # Step 4: Compute stroke angles from junction graph
+            stroke_angles, stroke_lengths = self._compute_stroke_angles(pruned, junctions, endpoints)
+            
+            # Step 5: Build geometric graph representation
+            graph = self._build_glyph_graph(junctions, endpoints, branch_points, 
+                                           glyph["bbox"], stroke_angles, stroke_lengths)
+            all_graphs.append(graph)
+            
+            # Step 6: Compute structural metrics
+            metrics = {
+                "glyph_index": glyph["index"],
+                "bounding_box": glyph["bbox"],
+                "center": glyph["center"],
+                "area": glyph["area"],
+                "aspect_ratio": glyph["aspect_ratio"],
+                "solidity": glyph["solidity"],
+                
+                # Skeleton metrics
+                "skeleton_pixels": int(np.sum(pruned > 0)),
+                "junction_count": len(junctions),
+                "endpoint_count": len(endpoints),
+                "branch_count": len(stroke_lengths),
+                "avg_stroke_length": float(np.mean(stroke_lengths)) if stroke_lengths else 0,
+                "std_stroke_length": float(np.std(stroke_lengths)) if len(stroke_lengths) > 1 else 0,
+                
+                # Angle metrics
+                "stroke_angles_deg": [float(f"{a:.1f}") for a in stroke_angles],
+                "stroke_lengths_px": [float(f"{l:.1f}") for l in stroke_lengths],
+                
+                # Derived metrics
+                "complexity_score": float(f"{self._compute_complexity(glyph, junctions, stroke_lengths):.3f}"),
+                "elongation": float(f"{self._compute_elongation(mask):.3f}"),
+                "compactness": float(f"{self._compute_compactness(mask):.3f}"),
+            }
+            analysis["glyph_metrics"].append(metrics)
+        
+        # Build combined skeleton visualization
+        combined = np.zeros((h, w), dtype=np.uint8)
+        for glyph in glyphs:
+            x, y, w_g, h_g = glyph["bbox"]
+            sk = medial_axis(glyph["mask"] > 0).astype(np.uint8) * 255
+            if sk.shape[0] <= h_g and sk.shape[1] <= w_g:
+                combined[y:y+sk.shape[0], x:x+sk.shape[1]] = np.maximum(
+                    combined[y:y+sk.shape[0], x:x+sk.shape[1]], sk)
+        
+        # Color skeleton overlay on original
+        orig = cv2.imread(glyphs[0].get("_source_path", "")) if "gray" in glyphs[0] else None
+        if orig is None:
+            # Create a blank canvas with bounding boxes
+            orig_vis = np.zeros((h, w, 3), dtype=np.uint8)
+            for g in glyphs:
+                x, y, w_b, h_b = g["bbox"]
+                cv2.rectangle(orig_vis, (x, y), (x + w_b, y + h_b), (40, 40, 40), 1)
+        else:
+            orig_vis = orig.copy()
+        
+        # Overlay skeleton in cyan
+        sk_colored = np.stack([combined * 0, combined * 255, combined * 255], axis=2)
+        skeleton_overlay = cv2.addWeighted(orig_vis, 0.7, sk_colored, 0.8, 0)
+        
+        # Draw junction points in red
+        for glyph_metrics, glyph_obj in zip(analysis["glyph_metrics"], glyphs):
+            # Recompute junctions for drawing
+            x, y, w_g, h_g = glyph_obj["bbox"]
+            sk = medial_axis(glyph_obj["mask"] > 0).astype(np.uint8) * 255
+            pruned = self._prune_skeleton(sk, 3)
+            junctions, endpoints, _ = self._analyze_skeleton_topology(pruned)
+            
+            for jx, jy in junctions:
+                abs_x, abs_y = x + jx, y + jy
+                cv2.circle(skeleton_overlay, (abs_x, abs_y), 3, (0, 0, 255), -1)
+            for ex, ey in endpoints:
+                abs_x, abs_y = x + ex, y + ey
+                cv2.circle(skeleton_overlay, (abs_x, abs_y), 2, (255, 0, 255), -1)
+        
+        analysis["skeletons_visual"] = skeleton_overlay
+        analysis["combined_skeleton"] = combined
+        self._last_skeleton = combined
+        self._last_glyph_graphs = all_graphs
+        
+        # Generate overall report
+        analysis["overall_report"] = self._generate_overall_report(analysis)
+        self._last_report = analysis["overall_report"]
+        
+        return analysis
+    
+    def _prune_skeleton(self, skeleton, min_branch_length=3):
+        """Prune small branches from skeleton to remove noise artifacts."""
+        if np.sum(skeleton) == 0:
+            return skeleton
+        
+        pruned = skeleton.copy()
+        h, w = skeleton.shape
+        
+        # Iteratively remove short branches
+        changed = True
+        while changed:
+            changed = False
+            kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+            
+            # Find endpoints (pixels with exactly 1 neighbor)
+            neighbor_count = cv2.filter2D(
+                (pruned > 0).astype(np.uint8), -1, kernel
+            )
+            neighbor_count[pruned == 0] = 0
+            endpoints_map = (neighbor_count == 2) & (pruned > 0)  # cross kernel sum=2 for one neighbor
+            
+            # Trace from each endpoint
+            ys, xs = np.where(endpoints_map)
+            for ex, ey in zip(xs, ys):
+                branch_length = 0
+                cx, cy = ex, ey
+                visited = set()
+                while True:
+                    if (cx, cy) in visited or cy >= h or cx >= w:
+                        break
+                    visited.add((cx, cy))
+                    # Check neighbors
+                    y1, y2 = max(0, cy-1), min(h-1, cy+1)
+                    x1, x2 = max(0, cx-1), min(w-1, cx+1)
+                    neighbors = []
+                    for ny in range(y1, y2+1):
+                        for nx in range(x1, x2+1):
+                            if (nx, ny) not in visited and pruned[ny, nx] > 0:
+                                neighbors.append((nx, ny))
+                    if len(neighbors) == 1:
+                        cx, cy = neighbors[0]
+                        branch_length += 1
+                    else:
+                        break
+                
+                if branch_length < min_branch_length and branch_length > 0:
+                    # Remove this branch
+                    for px, py in visited:
+                        if 0 <= py < h and 0 <= px < w:
+                            pruned[py, px] = 0
+                    changed = True
+        
+        return pruned
+    
+    def _analyze_skeleton_topology(self, skeleton):
+        """Find junction points (≥3 neighbors) and endpoints (1 neighbor) in skeleton."""
+        if np.sum(skeleton) == 0:
+            return [], [], []
+        
+        h, w = skeleton.shape
+        kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+        neighbor_count = cv2.filter2D(
+            (skeleton > 0).astype(np.uint8), -1, kernel
+        )
+        neighbor_count[skeleton == 0] = 0
+        
+        # Endpoints have exactly 1 neighbor (sum=2 with cross kernel)
+        endpoints = np.where((neighbor_count == 2) & (skeleton > 0))
+        
+        # Junction points have 3+ neighbors (sum >= 4 with cross kernel)
+        junctions = np.where((neighbor_count >= 4) & (skeleton > 0))
+        
+        # Branch points (2 neighbors = regular path pixel)
+        branch_points = np.where((neighbor_count == 3) & (skeleton > 0))
+        
+        junction_list = list(zip(junctions[1], junctions[0]))  # (x, y)
+        endpoint_list = list(zip(endpoints[1], endpoints[0]))
+        branch_list = list(zip(branch_points[1], branch_points[0]))
+        
+        # Cluster nearby junctions (merge if within 2 pixels)
+        merged_junctions = []
+        for jx, jy in junction_list:
+            found = False
+            for mi, (mx, my) in enumerate(merged_junctions):
+                if abs(jx - mx) <= 2 and abs(jy - my) <= 2:
+                    merged_junctions[mi] = ((mx + jx) // 2, (my + jy) // 2)
+                    found = True
+                    break
+            if not found:
+                merged_junctions.append((jx, jy))
+        
+        return merged_junctions, endpoint_list, branch_list
+    
+    def _compute_stroke_angles(self, skeleton, junctions, endpoints):
+        """Compute angles and lengths of strokes between junction points."""
+        stroke_angles = []
+        stroke_lengths = []
+        
+        all_points = junctions + endpoints
+        if len(all_points) < 2:
+            return stroke_angles, stroke_lengths
+        
+        # For each pair of junction/endpoint points, trace the path
+        for i, (x1, y1) in enumerate(all_points):
+            for j, (x2, y2) in enumerate(all_points):
+                if j <= i:
+                    continue
+                # Check if there's a direct skeleton path
+                # Simple heuristic: line between points should have significant overlap with skeleton
+                dy = y2 - y1
+                dx = x2 - x1
+                dist = math.sqrt(dx*dx + dy*dy)
+                if dist < 5:
+                    continue
+                
+                # Sample points along the line
+                num_samples = max(2, int(dist / 2))
+                overlap = 0
+                for s in range(num_samples + 1):
+                    t = s / num_samples
+                    px = int(x1 + t * dx)
+                    py = int(y1 + t * dy)
+                    h, w = skeleton.shape[:2] if skeleton.ndim == 2 else skeleton.shape[:2]
+                    if 0 <= py < h and 0 <= px < w and skeleton[py, px] > 0:
+                        overlap += 1
+                
+                overlap_ratio = overlap / (num_samples + 1)
+                if overlap_ratio > 0.4:  # Significant path overlap
+                    angle = math.degrees(math.atan2(dy, dx))
+                    stroke_angles.append(angle)
+                    stroke_lengths.append(dist)
+        
+        return stroke_angles, stroke_lengths
+    
+    def _build_glyph_graph(self, junctions, endpoints, branch_points, bbox, angles, lengths):
+        """Build a graph representation of the glyph skeleton.
+        
+        Graph nodes = junction points and endpoints (coordinates)
+        Graph edges = strokes connecting nodes (with angle and length attributes)
+        """
+        graph = {
+            "nodes": [],
+            "edges": [],
+            "node_count": len(junctions) + len(endpoints),
+            "edge_count": len(angles)
+        }
+        
+        # Add junction nodes
+        for i, (x, y) in enumerate(junctions):
+            graph["nodes"].append({
+                "id": f"J{i}",
+                "type": "junction",
+                "x": int(x),
+                "y": int(y),
+                "relative_x": int(x),  # Relative to glyph bbox
+                "relative_y": int(y)
+            })
+        
+        # Add endpoint nodes
+        for i, (x, y) in enumerate(endpoints):
+            graph["nodes"].append({
+                "id": f"E{i}",
+                "type": "endpoint",
+                "x": int(x),
+                "y": int(y),
+                "relative_x": int(x),
+                "relative_y": int(y)
+            })
+        
+        # Build edges from the angle/length data
+        # This pairs nodes that have direct connections
+        if angles and lengths:
+            for i, (angle, length) in enumerate(zip(angles, lengths)):
+                graph["edges"].append({
+                    "id": i,
+                    "angle_deg": float(f"{angle:.1f}"),
+                    "length_px": float(f"{length:.1f}"),
+                    "normalized_length": float(f"{length / max(lengths, default=1):.3f}"),
+                    "source_node": None,  # Would need full path tracing
+                    "target_node": None
+                })
+        
+        return graph
+    
+    def _compute_complexity(self, glyph, junctions, stroke_lengths):
+        """Compute a complexity score for the glyph based on topology."""
+        junction_score = len(junctions) * 0.3
+        branch_score = len(stroke_lengths) * 0.2
+        area_score = math.log(max(glyph["area"], 1)) * 0.1
+        return min(10.0, junction_score + branch_score + area_score)
+    
+    def _compute_elongation(self, mask):
+        """Compute elongation: 1 - (width/height) normalized."""
+        h, w = mask.shape[:2]
+        if h == 0:
+            return 0
+        return float(w) / max(h, 1)
+    
+    def _compute_compactness(self, mask):
+        """Compute compactness: 4π * area / perimeter² (circle = 1)."""
+        contours, _ = cv2.findContours(
+            (mask > 0).astype(np.uint8),
+            cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        if not contours:
+            return 0
+        perimeter = cv2.arcLength(contours[0], True)
+        area = cv2.contourArea(contours[0])
+        if perimeter == 0:
+            return 0
+        compactness = (4 * math.pi * area) / (perimeter * perimeter)
+        return min(1.0, max(0.0, compactness))
+    
+    def _generate_overall_report(self, analysis):
+        """Generate the final scientific analysis report."""
+        metrics = analysis.get("glyph_metrics", [])
+        if not metrics:
+            return {"error": "No glyphs detected for analysis"}
+        
+        report = {
+            "phase": "Scientific Glyph Analysis Complete",
+            "pipeline": [
+                "Phase 1: CV Layer — Adaptive thresholding → Morphological clean → Connected component segmentation",
+                "Phase 2: Geometric Layer — Medial Axis Skeletonization → Graph Theory → Topological Analysis"
+            ],
+            "summary": {}
+        }
+        
+        # Aggregate metrics
+        glyph_count = len(metrics)
+        total_area = sum(m["area"] for m in metrics)
+        avg_aspect = np.mean([m["aspect_ratio"] for m in metrics])
+        avg_solidity = np.mean([m["solidity"] for m in metrics])
+        total_junctions = sum(m["junction_count"] for m in metrics)
+        total_endpoints = sum(m["endpoint_count"] for m in metrics)
+        total_branches = sum(m["branch_count"] for m in metrics)
+        avg_complexity = np.mean([m["complexity_score"] for m in metrics])
+        
+        report["summary"] = {
+            "glyphs_detected": glyph_count,
+            "total_glyph_area_px": int(total_area),
+            "avg_aspect_ratio": float(f"{avg_aspect:.3f}"),
+            "avg_solidity": float(f"{avg_solidity:.3f}"),
+            "total_junction_points": int(total_junctions),
+            "total_endpoints": int(total_endpoints),
+            "total_stroke_branches": int(total_branches),
+            "avg_complexity_score": float(f"{avg_complexity:.3f}"),
+            "junction_to_endpoint_ratio": float(
+                f"{(total_junctions / max(total_endpoints, 1)):.3f}"
+            ),
+            "branches_per_glyph": float(f"{(total_branches / max(glyph_count, 1)):.2f}"),
+        }
+        
+        # Per-glyph detailed metrics
+        report["per_glyph"] = []
+        for m in metrics:
+            report["per_glyph"].append({
+                "glyph": m["glyph_index"],
+                "bbox": m["bounding_box"],
+                "structural": {
+                    "skeleton_pixels": m["skeleton_pixels"],
+                    "junctions": m["junction_count"],
+                    "endpoints": m["endpoint_count"],
+                    "branches": m["branch_count"],
+                    "avg_stroke_length": m["avg_stroke_length"],
+                },
+                "morphological": {
+                    "area": m["area"],
+                    "aspect_ratio": m["aspect_ratio"],
+                    "solidity": m["solidity"],
+                    "elongation": m["elongation"],
+                    "compactness": m["compactness"],
+                    "complexity": m["complexity_score"],
+                },
+                "geometry": {
+                    "stroke_angles": m["stroke_angles_deg"],
+                    "stroke_lengths": m["stroke_lengths_px"],
+                }
+            })
+        
+        return report
+    
+    def compute_similarity(self, glyph1_mask, glyph2_mask):
+        """Compute deterministic shape similarity between two glyphs.
+        
+        Uses:
+        - Hausdorff distance (contour deviation)
+        - Procrustes analysis (shape alignment)
+        - Overlap coefficient (structural similarity)
+        
+        Returns dict with similarity metrics (0-1 scale, 1 = identical).
+        """
+        if glyph1_mask is None or glyph2_mask is None:
+            return {"error": "Invalid glyph masks"}
+        
+        # Skeletonize both
+        sk1 = medial_axis(glyph1_mask > 0).astype(np.uint8)
+        sk2 = medial_axis(glyph2_mask > 0).astype(np.uint8)
+        
+        result = {}
+        
+        # 1. Hausdorff Distance (contour comparison)
+        cnt1_points = np.column_stack(np.where(sk1 > 0))
+        cnt2_points = np.column_stack(np.where(sk2 > 0))
+        
+        if len(cnt1_points) > 0 and len(cnt2_points) > 0:
+            h_dist = directed_hausdorff(cnt1_points, cnt2_points)[0]
+            max_dim = max(glyph1_mask.shape[0], glyph1_mask.shape[1])
+            hausdorff_similarity = max(0, 1 - (h_dist / max_dim))
+            result["hausdorff_similarity"] = float(f"{hausdorff_similarity:.4f}")
+        else:
+            result["hausdorff_similarity"] = 0
+        
+        # 2. Procrustes Analysis (shape alignment)
+        try:
+            if len(cnt1_points) > 3 and len(cnt2_points) > 3:
+                # Resample to same number of points
+                n_points = min(100, min(len(cnt1_points), len(cnt2_points)))
+                
+                if len(cnt1_points) > n_points:
+                    idx = np.linspace(0, len(cnt1_points)-1, n_points, dtype=int)
+                    p1 = cnt1_points[idx]
+                else:
+                    p1 = cnt1_points
+                    
+                if len(cnt2_points) > n_points:
+                    idx = np.linspace(0, len(cnt2_points)-1, n_points, dtype=int)
+                    p2 = cnt2_points[idx]
+                else:
+                    p2 = cnt2_points
+                
+                # Pad to same length
+                max_len = max(len(p1), len(p2))
+                if len(p1) < max_len:
+                    pad = np.tile(p1[-1:], (max_len - len(p1), 1))
+                    p1 = np.vstack([p1, pad])
+                if len(p2) < max_len:
+                    pad = np.tile(p2[-1:], (max_len - len(p2), 1))
+                    p2 = np.vstack([p2, pad])
+                
+                # Procrustes
+                _, _, disparity = procrustes(p1, p2)
+                procrustes_similarity = max(0, 1 - disparity)
+                result["procrustes_similarity"] = float(f"{procrustes_similarity:.4f}")
+            else:
+                result["procrustes_similarity"] = 0
+        except Exception:
+            result["procrustes_similarity"] = 0
+        
+        # 3. Skeleton overlap (structural similarity)
+        # Resize larger to match smaller
+        h1, w1 = sk1.shape[:2]
+        h2, w2 = sk2.shape[:2]
+        target_h, target_w = min(h1, h2), min(w1, w2)
+        
+        sk1_resized = cv2.resize(sk1, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+        sk2_resized = cv2.resize(sk2, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+        
+        intersection = np.sum((sk1_resized > 0) & (sk2_resized > 0))
+        union = np.sum((sk1_resized > 0) | (sk2_resized > 0))
+        overlap = intersection / max(union, 1)
+        result["structural_overlap"] = float(f"{overlap:.4f}")
+        
+        # Overall structural similarity score
+        result["overall_similarity"] = float(f"{(result.get('hausdorff_similarity', 0) * 0.3 + result.get('procrustes_similarity', 0) * 0.3 + overlap * 0.4):.4f}")
+        
+        return result
+    
+    def compute_structural_distance(self, metrics_a, metrics_b):
+        """Compute structural distance between two glyphs' metrics.
+        
+        Uses feature vector comparison (Euclidean distance on normalized features).
+        """
+        features_a = np.array([
+            metrics_a.get("junction_count", 0),
+            metrics_a.get("endpoint_count", 0),
+            metrics_a.get("branch_count", 0),
+            metrics_a.get("avg_stroke_length", 0),
+            metrics_a.get("complexity_score", 0),
+            metrics_a.get("aspect_ratio", 0),
+            metrics_a.get("solidity", 0),
+        ])
+        
+        features_b = np.array([
+            metrics_b.get("junction_count", 0),
+            metrics_b.get("endpoint_count", 0),
+            metrics_b.get("branch_count", 0),
+            metrics_b.get("avg_stroke_length", 0),
+            metrics_b.get("complexity_score", 0),
+            metrics_b.get("aspect_ratio", 0),
+            metrics_b.get("solidity", 0),
+        ])
+        
+        # Normalize (simple scaling)
+        max_vals = np.maximum(np.abs(features_a), np.abs(features_b))
+        max_vals[max_vals == 0] = 1
+        
+        norm_a = features_a / max_vals
+        norm_b = features_b / max_vals
+        
+        distance = np.linalg.norm(norm_a - norm_b)
+        similarity = max(0, 1 - distance / math.sqrt(len(features_a)))
+        
+        return {
+            "euclidean_distance": float(f"{distance:.4f}"),
+            "normalized_similarity": float(f"{similarity:.4f}")
+        }
+    
+    def full_pipeline(self, image_path):
+        """Run the complete two-phase pipeline.
+        
+        Returns comprehensive dict with Phase 1 and Phase 2 results.
+        """
+        result = {
+            "image_path": image_path,
+            "pipeline_phases": ["Phase 1: AI/CV Layer", "Phase 2: Geometric Layer"],
+            "phase1": {},
+            "phase2": {},
+            "status": "running"
+        }
+        
+        try:
+            # Phase 1: Clean and extract
+            phase1 = self.phase1_clean_and_extract(image_path)
+            result["phase1"] = {
+                "glyphs_detected": phase1["segmentation_count"],
+                "image_shape": phase1["original_shape"],
+                "visualization_available": phase1.get("visualization") is not None,
+                "glyph_count": len(phase1["glyphs"])
+            }
+            
+            # Phase 2: Geometric analysis
+            phase2 = self.phase2_geometric_analysis(phase1)
+            result["phase2"] = phase2
+            
+            result["status"] = "complete"
+            result["report"] = phase2.get("overall_report", {})
+            
+        except Exception as e:
+            result["status"] = "error"
+            result["error"] = str(e)
+        
+        return result
+
+
 class ScriptAnalysisPage(QWidget):
     """Script Analysis page with drag-drop image upload, writing system selection,
     AI analysis, translation results, probable attributes, and statistical charts."""
@@ -2858,6 +4884,20 @@ class ScriptAnalysisPage(QWidget):
             "QComboBox { background: #0f0f0f; border: 1px solid #2a2a2a; border-radius: 4px; padding: 6px 10px; color: #dddddd; font-size: 12px; }"
             "QComboBox::drop-down { border: none; }")
         controls_lay.addWidget(self.script_model_combo)
+
+        # Pipeline Config Button (Non-Intrusive)
+        pipeline_label = QLabel("DUAL-PHASE PARAMETERS")
+        pipeline_label.setStyleSheet("color: #383838; font-size: 9px; font-weight: bold; letter-spacing: 2px;")
+        pipeline_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        controls_lay.addWidget(pipeline_label)
+
+        self.pipeline_settings_btn = QPushButton("⚙ Configure Pipeline")
+        self.pipeline_settings_btn.setStyleSheet("""
+            QPushButton { background: #161616; border: 1px solid #333333; color: #ffaa00; font-size: 11px; padding: 5px; }
+            QPushButton:hover { background: #222222; border-color: #bb4400; }
+        """)
+        self.pipeline_settings_btn.clicked.connect(self._open_pipeline_config)
+        controls_lay.addWidget(self.pipeline_settings_btn)
 
         controls_lay.addSpacing(10)
 
@@ -3156,6 +5196,9 @@ class ScriptAnalysisPage(QWidget):
             )
             self._analysis_worker.output_ready.connect(self._append_analysis_chunk)
             self._analysis_worker.finished_signal.connect(self._finished_analysis)
+            self._analysis_worker.finished.connect(
+                lambda worker=self._analysis_worker: self._cleanup_analysis_worker(worker)
+            )
         else:
             # Use local Ollama model
             base_url = self._get_ollama_url()
@@ -3164,6 +5207,9 @@ class ScriptAnalysisPage(QWidget):
             )
             self._analysis_worker.chunk_ready.connect(self._append_analysis_chunk)
             self._analysis_worker.finished_signal.connect(self._finished_analysis)
+            self._analysis_worker.finished.connect(
+                lambda worker=self._analysis_worker: self._cleanup_analysis_worker(worker)
+            )
 
         self._analysis_worker.start()
 
@@ -3179,10 +5225,14 @@ class ScriptAnalysisPage(QWidget):
         self.progress_updated.emit(pct)
         self._analysis_result_buffer += chunk
 
+    def _cleanup_analysis_worker(self, worker):
+        if self._analysis_worker is worker:
+            self._analysis_worker = None
+        worker.deleteLater()
+
     def _finished_analysis(self, success, err_message):
         self.analyse_btn.setEnabled(True)
         self.analyse_btn.setText("🔍  ANALYSE SCRIPT")
-        self._analysis_worker = None
 
         if not success:
             self.translation_output.setPlainText(f"Analysis failed: {err_message}")
@@ -3200,14 +5250,15 @@ class ScriptAnalysisPage(QWidget):
 
         # Parse the structured result
         self._parse_analysis_result(result)
+        pdf_report_path = self._generate_auto_script_pdf_report()
 
         # Save to AI database
-        run_ai_query(
-            "INSERT INTO ai_analysis_db (artifact_name, model_used, confidence_score, transcription, translation, notes, writing_system, letter_forms)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        run_ai_insert(
+            "INSERT INTO ai_analysis_db (artifact_name, model_used, confidence_score, transcription, translation, notes, writing_system, letter_forms, pdf_report_path)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (os.path.basename(self._selected_image_path), self._get_active_model(), "N/A",
              result, self.prob_labels["prob_name"].text() if hasattr(self, 'prob_labels') else "N/A",
-             "Script Analysis via Script Analysis Toolbar", "", "")
+             "Script Analysis via Script Analysis Toolbar", "", "", pdf_report_path)
         )
 
     def _parse_analysis_result(self, result):
@@ -3417,14 +5468,19 @@ class ScriptAnalysisPage(QWidget):
 
         return "\n".join(reasons)
 
+    def _open_pipeline_config(self):
+        """Open the CV/Geometric Pipeline configuration dialog."""
+        dialog = PipelineSettingsDialog(self)
+        dialog.exec()
+    
     def refresh_training_data(self):
         """Refresh the training data used for matching."""
         self._load_training_data()
 
-    def _generate_pdf_report(self):
-        """Generate a PDF report with all analysis data and save it to a user-chosen location."""
+    def generate_pdf_report(self):
+        """Generate a PDF report from the current script analysis result."""
         if not self._analysis_result_data:
-            QMessageBox.warning(self, "No Data", "Please run an analysis first before generating a report.")
+            QMessageBox.warning(self, "No Report Data", "Please run script analysis before generating a PDF report.")
             return
 
         # Ask user for save location and filename
@@ -3548,6 +5604,95 @@ class ScriptAnalysisPage(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "PDF Error", f"Failed to generate PDF report:\n{str(e)}")
 
+    def _generate_auto_script_pdf_report(self):
+        if not self._analysis_result_data:
+            return ""
+        report_dir = ensure_ai_report_folder()
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        image_name = os.path.splitext(os.path.basename(self._selected_image_path or "script_image"))[0]
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", image_name)
+        file_path = os.path.join(report_dir, f"{timestamp}_{safe_name}_script_analysis_report.pdf")
+        chart_items = self.bar_chart._data if hasattr(self.bar_chart, '_data') else []
+        try:
+            pdf = FPDF()
+            pdf.set_auto_page_break(auto=True, margin=14)
+            pdf.add_page()
+            pdf.set_font("Helvetica", "B", 16)
+            pdf.cell(0, 10, pdf_safe_text("PANDU - Human-Readable Script Analysis Report"), new_x="LMARGIN", new_y="NEXT", align="C")
+            pdf.ln(2)
+            pdf.set_font("Helvetica", "", 9)
+            pdf.multi_cell(0, 5, pdf_safe_text(
+                f"Image: {os.path.basename(self._selected_image_path or 'Unknown')}\n"
+                f"Model: {self._get_active_model()}\n"
+                f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            ))
+
+            self._script_pdf_section(pdf, "Plain-English Result")
+            summary = (
+                f"Pandu identified the probable writing system as {self._analysis_result_data.get('prob_ws', 'not determined')} "
+                f"and the probable source/name as {self._analysis_result_data.get('prob_name', 'not determined')}. "
+                "The interpretation is based on the model's reading of visible strokes, character shapes, layout, "
+                "contextual clues, and comparison with available script records."
+            )
+            pdf.set_font("Helvetica", "", 10)
+            pdf.multi_cell(0, 5.5, pdf_safe_text(summary))
+
+            self._script_pdf_section(pdf, "Translation / Reading")
+            pdf.multi_cell(0, 5.5, pdf_safe_text(self._analysis_result_data.get("translation") or "No translation available."))
+
+            self._script_pdf_section(pdf, "Why It Analysed It This Way")
+            pdf.multi_cell(0, 5.5, pdf_safe_text(self._analysis_result_data.get("reasoning") or "No reasoning was returned."))
+
+            self._script_pdf_section(pdf, "Graphical Confidence Data")
+            self._draw_script_pdf_chart(pdf, chart_items)
+
+            self._script_pdf_section(pdf, "Raw Analysis Logic")
+            pdf.set_font("Helvetica", "", 8)
+            pdf.multi_cell(0, 4.5, pdf_safe_text(self._analysis_result_data.get("full_result", "")[:6000]))
+            pdf.output(file_path)
+            return file_path
+        except Exception:
+            return ""
+
+    def _script_pdf_section(self, pdf, title):
+        if pdf.get_y() > 250:
+            pdf.add_page()
+        pdf.ln(5)
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.set_text_color(45, 85, 130)
+        pdf.cell(0, 8, pdf_safe_text(title), new_x="LMARGIN", new_y="NEXT")
+        pdf.set_draw_color(45, 85, 130)
+        pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+        pdf.ln(3)
+        pdf.set_text_color(30, 30, 30)
+
+    def _draw_script_pdf_chart(self, pdf, chart_items):
+        if not chart_items:
+            pdf.set_font("Helvetica", "", 10)
+            pdf.multi_cell(0, 5, "No chart data was produced.")
+            return
+        pdf.set_font("Helvetica", "", 9)
+        for label, value, color in chart_items:
+            if pdf.get_y() > 260:
+                pdf.add_page()
+            try:
+                value = max(0, min(100, float(value)))
+            except (TypeError, ValueError):
+                value = 0
+            hex_color = str(color).lstrip("#")
+            try:
+                r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
+            except Exception:
+                r, g, b = 70, 130, 180
+            pdf.cell(60, 6, pdf_safe_text(label[:28]))
+            pdf.set_fill_color(r, g, b)
+            pdf.cell(max(2, value), 6, "", fill=True)
+            pdf.cell(4, 6, "")
+            pdf.cell(0, 6, pdf_safe_text(f"{value:.1f}%"), new_x="LMARGIN", new_y="NEXT")
+
+    def _generate_pdf_report(self):
+        self.generate_pdf_report()
+
 
 # ── Main Application Framework Window ─────────────────────────────────────────
 
@@ -3607,11 +5752,11 @@ class MainWindow(QMainWindow):
         toolbar_layout = QHBoxLayout(self.toolbar_frame)
         toolbar_layout.setContentsMargins(6, 3, 6, 3)
         toolbar_layout.setSpacing(4)
-        items = ["Data Entry", "Library", "AI Analysis", "AI Database", "Train", "Script Analysis"]
+        items = ["Data Entry", "Library", "AI Analysis", "AI Database", "Geometric Analysis", "Train", "Script Analysis"]
         self.btns = {}
         for item in items:
             btn = QPushButton(item)
-            btn.setFixedSize(110, 28)
+            btn.setFixedSize(128 if item == "Geometric Analysis" else 104, 28)
             btn.setCheckable(True)
             btn.setStyleSheet("""
                 QPushButton { text-align: center; background: #0d0d0d; border: 1px solid #141414; color: #777; font-size: 11px; border-radius: 3px; }
@@ -3634,12 +5779,14 @@ class MainWindow(QMainWindow):
         self.library_page = LibraryPage()
         self.ai_analysis_page = AIAnalysisPage()
         self.ai_database_page = AIDatabasePage()
+        self.geometric_analysis_page = GeometricAnalysisPage()
         self.train_page = TrainPage()
         self.script_analysis_page = ScriptAnalysisPage()
         self.data_page.goToLibrary.connect(self.saved_to_library)
         pages = [
             self.data_page, self.library_page, self.ai_analysis_page,
-            self.ai_database_page, self.train_page, self.script_analysis_page
+            self.ai_database_page, self.geometric_analysis_page,
+            self.train_page, self.script_analysis_page
         ]
         self.pages = {}
         for idx, name in enumerate(items):
@@ -3660,7 +5807,11 @@ class MainWindow(QMainWindow):
         self.analysis_complete_label = QLabel("")
         self.analysis_complete_label.setFixedWidth(20)
         self.analysis_complete_label.setStyleSheet("color: #33ff33; font-size: 14px; font-weight: bold;")
+        self.analysis_timer_label = QLabel("Analysis time: 00:00")
+        self.analysis_timer_label.setFixedWidth(140)
+        self.analysis_timer_label.setStyleSheet("color: #666666; font-size: 10px;")
         progress_row.addWidget(self.analysis_progress_bar, 1)
+        progress_row.addWidget(self.analysis_timer_label)
         progress_row.addWidget(self.analysis_complete_label)
         layout.addLayout(progress_row)
 
@@ -3669,9 +5820,12 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.status_footer)
 
         self.ai_analysis_page.progress_updated.connect(self._update_analysis_progress)
+        self.ai_analysis_page.elapsed_updated.connect(self._update_analysis_elapsed)
         self.ai_analysis_page.analysis_completed.connect(self._on_analysis_completed)
         self.ai_analysis_page.analysis_paused_state.connect(self._on_analysis_paused)
         self.ai_analysis_page.analysis_stopped_state.connect(self._on_analysis_stopped)
+        self.geometric_analysis_page.progress_updated.connect(self._update_analysis_progress)
+        self.geometric_analysis_page.analysis_completed.connect(self._on_analysis_completed)
 
         # Connect Script Analysis page progress to main progress bar
         self.script_analysis_page.progress_updated.connect(self._update_analysis_progress)
@@ -3820,6 +5974,9 @@ class MainWindow(QMainWindow):
         elif value > 0:
             self.analysis_complete_label.setText("")
 
+    def _update_analysis_elapsed(self, text):
+        self.analysis_timer_label.setText(text)
+
     def _on_analysis_completed(self, completed):
         if completed:
             self.analysis_progress_bar.setValue(100)
@@ -3828,6 +5985,7 @@ class MainWindow(QMainWindow):
                 QProgressBar::chunk { background: #22aa55; border-radius: 2px; }
             """)
             self.analysis_complete_label.setText("✓")
+            QMessageBox.information(self, "Analysis Done", "Analysis done.")
 
     def _on_analysis_paused(self, paused):
         if paused:
@@ -3849,6 +6007,7 @@ class MainWindow(QMainWindow):
                 QProgressBar::chunk { background: #2255aa; border-radius: 2px; }
             """)
             self.analysis_complete_label.setText("")
+            self.analysis_timer_label.setText("Analysis time: 00:00")
 
     def closeEvent(self, event):
         PermissionManager.revoke_all()
@@ -3868,6 +6027,9 @@ class MainWindow(QMainWindow):
             elif name == "AI Analysis":
                 self.ai_analysis_page.update_banner_style()
                 self.ai_analysis_page.refresh_library_images()
+            elif name == "Geometric Analysis":
+                self.geometric_analysis_page.refresh_library_images()
+                self.geometric_analysis_page.load_saved_glyphs()
             elif name == "Train":
                 self.train_page.refresh_ai_db_path()
                 self.train_page.load_training_records()
