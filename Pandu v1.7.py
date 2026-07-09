@@ -2803,6 +2803,29 @@ class AIDatabasePage(QWidget):
             return ""
         return max(matches, key=lambda p: os.path.getmtime(p))
 
+    def find_analyzed_area_for_artifact(self, artifact_name):
+        _, math_dir = ensure_ai_pipeline_folders()
+        if not os.path.isdir(math_dir):
+            return ""
+        base = os.path.splitext(os.path.basename(artifact_name or ""))[0] or "image"
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", base)
+        matches = []
+        try:
+            for name in os.listdir(math_dir):
+                lowered = name.lower()
+                if not lowered.endswith("_analyzed_areas.png"):
+                    continue
+                if safe_name and safe_name not in name:
+                    continue
+                path = os.path.join(math_dir, name)
+                if os.path.isfile(path):
+                    matches.append(path)
+        except OSError:
+            return ""
+        if not matches:
+            return ""
+        return max(matches, key=lambda p: os.path.getmtime(p))
+
     def load_data(self):
         self.table.setRowCount(0)
         rows = run_ai_query(
@@ -2814,6 +2837,8 @@ class AIDatabasePage(QWidget):
             r_idx = self.table.rowCount(); self.table.insertRow(r_idx)
             overlay_path = row[10] if len(row) > 10 else ""
             image_path = row[9] if len(row) > 9 else ""
+            if not (overlay_path and os.path.exists(overlay_path)):
+                overlay_path = self.find_analyzed_area_for_artifact(row[1])
             pdf_path = row[17] if len(row) > 17 else ""
             if not (pdf_path and os.path.exists(pdf_path)):
                 pdf_path = self.find_pdf_report_for_artifact(row[1])
@@ -2821,12 +2846,15 @@ class AIDatabasePage(QWidget):
             area_btn.setFixedSize(34, 28)
             area_btn.setToolTip("Show AI analysed text areas")
             icon_source = overlay_path if overlay_path and os.path.exists(overlay_path) else image_path
+            view_path = overlay_path if overlay_path and os.path.exists(overlay_path) else icon_source
             if icon_source and os.path.exists(icon_source):
                 area_btn.setIcon(QIcon(icon_source))
                 area_btn.setIconSize(QSize(26, 22))
-                area_btn.clicked.connect(lambda checked, p=icon_source: self.view_analyzed_area(p))
+                area_btn.setToolTip(f"Show AI analysed text areas:\n{view_path}")
+                area_btn.clicked.connect(lambda checked, p=view_path: self.view_analyzed_area(p))
             else:
                 area_btn.setText("□")
+                area_btn.setToolTip("No analysed-area overlay was found for this record")
                 area_btn.setEnabled(False)
             self.table.setCellWidget(r_idx, 0, area_btn)
 
@@ -2890,10 +2918,13 @@ class AIDatabasePage(QWidget):
         lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         pix = QPixmap(path)
         if not pix.isNull():
-            lbl.setPixmap(pix.scaled(860, 640, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+            lbl.setPixmap(pix)
         else:
             lbl.setText("Could not load analysed-area image.")
-        layout.addWidget(lbl)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(lbl)
+        layout.addWidget(scroll, 1)
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(dlg.accept)
         layout.addWidget(close_btn)
