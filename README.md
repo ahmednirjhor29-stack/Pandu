@@ -39,6 +39,33 @@ Generate comprehensive PDF reports containing:
 - Permission manager for accessing protected files
 - Snap-to-screen-edge window management
 
+### Glyph-level structural datasets
+
+Geometric analysis now segments every script image into independent, line-ordered
+glyph candidates and exports reusable records under the configured AI database's
+`glyph_extraction_data` directory. Each dataset contains `glyphs.json`, a flattened
+`glyphs.csv`, `report.json`, and a `glyphs/` directory with per-glyph JSON, mask,
+and image crops. Records include geometry, stroke-width and skeleton statistics,
+topology, moments, projection/radial profiles, Fourier descriptors, confidence,
+and explicit uncertainty reasons for likely ligatures or ambiguous compounds.
+
+The reusable API can also be called independently:
+
+```python
+from glyph_structural_pipeline import GlyphStructuralPipeline
+
+result = GlyphStructuralPipeline().analyze("script.png", output_dir="glyph_dataset")
+```
+
+AI analysis also performs deterministic post-analysis vectorization. Open an
+analysed-area image from **AI Database**, choose **Edit Paths**, and use the Pen,
+Direct Select, and Delete Anchor tools to correct outer borders and hole paths.
+Undo/redo, keyboard nudging, automatic-trace reset, and unsaved-change warnings
+are included. Saving a path recalculates its net/vector area, perimeter, bounding
+box, all anchor and mesh angles, X/Y arrays, transparent cutout, overlay image,
+and parent database totals. Original automatic paths and edit revisions are kept
+for audit/reset purposes.
+
 ## Requirements
 
 - Python 3.8+

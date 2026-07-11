@@ -13,6 +13,7 @@ import datetime
 import math
 import re
 import hashlib
+import copy
 from fpdf import FPDF
 import cv2
 import numpy as np
@@ -20,6 +21,7 @@ from skimage.measure import label, regionprops
 from scipy.spatial import procrustes
 from scipy.spatial.distance import directed_hausdorff
 import collections
+from glyph_structural_pipeline import GlyphStructuralPipeline
 try:
     from google import genai
     from google.genai import types
@@ -176,13 +178,33 @@ class AIDatabaseManager:
                 "total_junction_points": "INTEGER",
                 "total_endpoints": "INTEGER",
                 "total_stroke_branches": "INTEGER",
+                "vectorization_status": "TEXT",
             }
             for col, col_type in geometry_cols.items():
                 if col not in existing_cols:
                     conn.execute(f"ALTER TABLE ai_analysis_db ADD COLUMN {col} {col_type}")
             glyph_cols = [row[1] for row in conn.execute("PRAGMA table_info(ai_glyphs)").fetchall()]
-            if "glyph_data_path" not in glyph_cols:
-                conn.execute("ALTER TABLE ai_glyphs ADD COLUMN glyph_data_path TEXT")
+            glyph_schema = {
+                "glyph_data_path": "TEXT",
+                "analysis_overlay_path": "TEXT",
+                "glyph_area": "REAL",
+                "angular_data": "TEXT",
+                "x_values": "TEXT",
+                "y_values": "TEXT",
+                "time_period": "TEXT",
+                "source": "TEXT",
+                "region": "TEXT",
+                "ai_analysis_record_id": "INTEGER",
+                "vector_revision": "INTEGER DEFAULT 1",
+                "ink_area_px": "REAL",
+                "vector_enclosed_area_px": "REAL",
+                "outline_perimeter_px": "REAL",
+            }
+            for col, col_type in glyph_schema.items():
+                if col not in glyph_cols:
+                    conn.execute(f"ALTER TABLE ai_glyphs ADD COLUMN {col} {col_type}")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_glyphs_analysis_record ON ai_glyphs(ai_analysis_record_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_glyphs_source_image ON ai_glyphs(source_image_path)")
             report_cols = [row[1] for row in conn.execute("PRAGMA table_info(geometric_analysis_reports)").fetchall()]
             report_schema = {
                 "artifact_name": "TEXT",
@@ -312,12 +334,28 @@ def render_glyph_trace_overlay(image_path, traces, out_path):
         return ""
     overlay = img.copy()
     for idx, trace in enumerate(traces):
+        x = y = w = h = 0
         polygon = trace.get("outline_polygon", [])
+        contour_paths = trace.get("contour_paths", []) or []
         triangles = trace.get("triangle_mesh", [])
         for tri in triangles:
             if len(tri) == 3:
                 cv2.polylines(overlay, [np.array(tri, dtype=np.int32)], True, (0, 180, 255), 1, cv2.LINE_AA)
-        if polygon:
+        if contour_paths:
+            outer_points = None
+            for path in contour_paths:
+                anchors = path.get("anchors", [])
+                if len(anchors) < 2:
+                    continue
+                pts = np.array(anchors, dtype=np.int32)
+                color = (220, 80, 255) if path.get("role") == "hole" else (255, 255, 255)
+                cv2.polylines(overlay, [pts], True, color, 3 if path.get("role") != "hole" else 2, cv2.LINE_AA)
+                if path.get("role") != "hole" and outer_points is None:
+                    outer_points = pts
+            pts = outer_points if outer_points is not None else np.array(contour_paths[0].get("anchors", []), dtype=np.int32)
+            if len(pts):
+                x, y, w, h = cv2.boundingRect(pts)
+        elif polygon:
             pts = np.array(polygon, dtype=np.int32)
             cv2.polylines(overlay, [pts], True, (255, 255, 255), 3, cv2.LINE_AA)
             for px, py in polygon:
@@ -341,6 +379,141 @@ def render_glyph_trace_overlay(image_path, traces, out_path):
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     cv2.imwrite(out_path, overlay)
     return out_path
+
+def calculate_editable_outline_geometry(polygon):
+    """Calculate the persisted geometry for an editable, absolute-coordinate path."""
+    points = [[int(round(p[0])), int(round(p[1]))] for p in (polygon or []) if len(p) >= 2]
+    if len(points) < 3:
+        return {
+            "outline_polygon": points, "x_values": [p[0] for p in points],
+            "y_values": [p[1] for p in points], "bbox": [], "area": 0.0,
+            "perimeter": 0.0, "centroid": [], "triangle_mesh": [],
+            "angular_data": {"units": "degrees", "outline_vertex_angles": [], "triangle_angles": []},
+        }
+    contour = np.asarray(points, dtype=np.float64)
+    has_duplicate_anchors = len({(p[0], p[1]) for p in points}) != len(points)
+    def segments_intersect(a, b, c, d):
+        def orientation(p, q, r):
+            value = (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+            return 0 if abs(value) <= 1e-9 else (1 if value > 0 else -1)
+        return orientation(a, b, c) != orientation(a, b, d) and orientation(c, d, a) != orientation(c, d, b)
+    self_intersects = any(
+        segments_intersect(points[i], points[(i + 1) % len(points)], points[j], points[(j + 1) % len(points)])
+        for i in range(len(points)) for j in range(i + 1, len(points))
+        if j not in (i, (i + 1) % len(points)) and i not in (j, (j + 1) % len(points))
+    )
+    contour_cv = contour.astype(np.float32).reshape(-1, 1, 2)
+    area = abs(float(cv2.contourArea(contour_cv)))
+    signed_twice_area = float(np.sum(
+        contour[:, 0] * np.roll(contour[:, 1], -1) - np.roll(contour[:, 0], -1) * contour[:, 1]
+    ))
+    orientation = "counterclockwise" if signed_twice_area > 0 else "clockwise"
+    perimeter = float(cv2.arcLength(contour_cv, True))
+    x, y, w, h = cv2.boundingRect(contour_cv.astype(np.int32))
+    moments = cv2.moments(contour_cv)
+    if abs(moments.get("m00", 0.0)) > 1e-9:
+        centroid = [float(moments["m10"] / moments["m00"]), float(moments["m01"] / moments["m00"])]
+    else:
+        centroid = [float(np.mean(contour[:, 0])), float(np.mean(contour[:, 1]))]
+
+    vertex_angles = []
+    edge_lengths = []
+    for index, current in enumerate(contour):
+        previous = contour[(index - 1) % len(contour)]
+        following = contour[(index + 1) % len(contour)]
+        arm_a, arm_b = previous - current, following - current
+        len_a, len_b = float(np.linalg.norm(arm_a)), float(np.linalg.norm(arm_b))
+        cosine = float(np.clip(np.dot(arm_a, arm_b) / max(len_a * len_b, 1e-9), -1.0, 1.0))
+        interior = math.degrees(math.acos(cosine))
+        incoming, outgoing = current - previous, following - current
+        turn = math.degrees(math.atan2(
+            incoming[0] * outgoing[1] - incoming[1] * outgoing[0],
+            float(np.dot(incoming, outgoing)),
+        ))
+        is_reflex = (turn < 0) if orientation == "counterclockwise" else (turn > 0)
+        vertex_angles.append({
+            "anchor_index": index, "point": points[index],
+            "interior_angle_degrees": round(360.0 - interior if is_reflex else interior, 6),
+            "turn_angle_degrees": round(turn, 6),
+        })
+        edge_lengths.append(round(float(np.linalg.norm(following - current)), 6))
+
+    # Ear clipping keeps every triangle inside a valid simple concave polygon.
+    indices = list(range(len(points)))
+    triangles = []
+    winding = 1.0 if signed_twice_area > 0 else -1.0
+
+    def cross_value(a, b, c):
+        return (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0])
+
+    def point_in_triangle(point, a, b, c):
+        def sign(p1, p2, p3):
+            return (p1[0] - p3[0]) * (p2[1] - p3[1]) - (p2[0] - p3[0]) * (p1[1] - p3[1])
+        d1, d2, d3 = sign(point, a, b), sign(point, b, c), sign(point, c, a)
+        return not ((d1 < -1e-9 or d2 < -1e-9 or d3 < -1e-9) and
+                    (d1 > 1e-9 or d2 > 1e-9 or d3 > 1e-9))
+
+    # A pen-tool anchor may intentionally sit on a straight segment. Keep it in
+    # the editable path/angle data, but omit it from triangulation to avoid a
+    # zero-area ear.
+    simplified_indices = []
+    for index in indices:
+        previous = points[(index - 1) % len(points)]
+        current = points[index]
+        following = points[(index + 1) % len(points)]
+        if abs(cross_value(previous, current, following)) <= 1e-9:
+            continue
+        simplified_indices.append(index)
+    if len(simplified_indices) >= 3:
+        indices = simplified_indices
+    triangulation_vertex_count = len(indices)
+
+    guard = 0
+    while len(indices) > 3 and guard < len(points) * len(points):
+        ear_found = False
+        for position, current_index in enumerate(indices):
+            previous_index = indices[position - 1]
+            next_index = indices[(position + 1) % len(indices)]
+            a, b, c = points[previous_index], points[current_index], points[next_index]
+            if cross_value(a, b, c) * winding <= 1e-9:
+                continue
+            if any(point_in_triangle(points[other], a, b, c)
+                   for other in indices if other not in (previous_index, current_index, next_index)):
+                continue
+            triangles.append([a, b, c])
+            del indices[position]
+            ear_found = True
+            break
+        if not ear_found:
+            break
+        guard += 1
+    if len(indices) == 3:
+        triangles.append([points[indices[0]], points[indices[1]], points[indices[2]]])
+    triangulation_complete = (len(triangles) == triangulation_vertex_count - 2 and
+                              not has_duplicate_anchors and not self_intersects)
+    triangle_angles = []
+    for triangle_index, triangle in enumerate(triangles):
+        tri = np.asarray(triangle, dtype=np.float64)
+        values = []
+        for vertex in range(3):
+            arm_a = tri[(vertex - 1) % 3] - tri[vertex]
+            arm_b = tri[(vertex + 1) % 3] - tri[vertex]
+            denominator = max(float(np.linalg.norm(arm_a) * np.linalg.norm(arm_b)), 1e-9)
+            values.append(round(math.degrees(math.acos(float(np.clip(np.dot(arm_a, arm_b) / denominator, -1.0, 1.0)))), 6))
+        triangle_angles.append({"triangle": triangle_index, "angles_degrees": values})
+    return {
+        "outline_polygon": points,
+        "x_values": [p[0] for p in points], "y_values": [p[1] for p in points],
+        "bbox": [int(x), int(y), int(w), int(h)], "area": round(area, 6),
+        "perimeter": round(perimeter, 6), "centroid": [round(v, 6) for v in centroid],
+        "orientation": orientation, "edge_lengths": edge_lengths, "triangle_mesh": triangles,
+        "triangulation_complete": triangulation_complete,
+        "angular_data": {
+            "units": "degrees", "orientation": orientation,
+            "outline_vertex_angles": vertex_angles, "triangle_angles": triangle_angles,
+            "interior_angle_sum_degrees": round(sum(v["interior_angle_degrees"] for v in vertex_angles), 6),
+        },
+    }
 
 # ── Permission Manager ────────────────────────────────────────────────────────
 
@@ -674,6 +847,17 @@ class GlyphSegmentationWorker(QThread):
         try:
             analyzer = ScientificGlyphAnalyzer()
             result = analyzer.phase1_clean_and_extract(self.image_path)
+            phase2 = analyzer.phase2_geometric_analysis(result)
+            metrics_by_index = {
+                metric.get("glyph_index"): metric for metric in phase2.get("glyph_metrics", [])
+            }
+            for glyph in result.get("glyphs", []):
+                metrics = metrics_by_index.get(glyph.get("index"), {})
+                glyph["analysis_metrics"] = metrics
+                glyph["angular_data"] = metrics.get("angular_data", {})
+                glyph["x_values"] = metrics.get("x_values", [])
+                glyph["y_values"] = metrics.get("y_values", [])
+            result["geometric_analysis"] = phase2
             self.finished_signal.emit(True, "", result)
         except Exception as e:
             self.finished_signal.emit(False, str(e), {})
@@ -1006,12 +1190,13 @@ class ImageUploadWidget(QWidget):
         if paths: self.imagesDropped.emit(paths)
 
 class DataPage(QWidget):
-    goToLibrary = pyqtSignal(dict)
+    recordSaved = pyqtSignal(dict)
     def __init__(self):
         super().__init__()
         self.staged = []
         self.settings = load_settings()
         self.img_path = ""
+        self.queue_saved_count = 0
         layout = QVBoxLayout(self)
         self.uploader = ImageUploadWidget()
         self.uploader.imagesDropped.connect(self.process_images)
@@ -1027,6 +1212,13 @@ class DataPage(QWidget):
         form_frame = QFrame()
         form_frame.setStyleSheet("QFrame { background: #0d0d0d; border: 1px solid #1f1f1f; border-radius: 6px; }")
         form_lay = QVBoxLayout(form_frame)
+        self.current_image_label = QLabel("No image queued for metadata")
+        self.current_image_label.setWordWrap(True)
+        self.current_image_label.setStyleSheet(
+            "QLabel { background: #111827; border: 1px solid #29405f; border-radius: 4px; "
+            "color: #8fc7ff; font-size: 12px; font-weight: bold; padding: 8px; }"
+        )
+        form_lay.addWidget(self.current_image_label)
         self.name = QLineEdit()
         self.ws = QComboBox(); self.ws.addItems(self.settings["writing_systems"])
         self.start_yr = QLineEdit(); self.end_yr = QLineEdit()
@@ -1078,19 +1270,39 @@ class DataPage(QWidget):
         self.thread.start()
     def loading_done(self, valid):
         if valid:
+            if not self.staged:
+                self.queue_saved_count = 0
             self.staged.extend(valid)
             self.uploader.update_list(self.staged)
-            self.img_path = self.staged[0]
-            self.save_btn.setEnabled(True)
+            self._update_current_image()
         else: QMessageBox.warning(self, "Error", "No compatible images added.")
         self.p_box.hide()
     def remove_image(self, path):
         if path in self.staged: self.staged.remove(path)
         self.uploader.update_list(self.staged)
-        self.save_btn.setEnabled(bool(self.staged))
-        self.img_path = self.staged[0] if self.staged else ""
+        self._update_current_image()
         if not self.staged: self.p_box.hide()
+    def _update_current_image(self, saved_name=""):
+        self.img_path = self.staged[0] if self.staged else ""
+        self.save_btn.setEnabled(bool(self.img_path))
+        if self.img_path:
+            current_name = os.path.basename(self.img_path)
+            prefix = f"Saved: {saved_name}\n\n" if saved_name else ""
+            queue_total = self.queue_saved_count + len(self.staged)
+            queue_position = self.queue_saved_count + 1
+            self.current_image_label.setText(
+                f"{prefix}Metadata for image {queue_position} of {queue_total}:\n{current_name}"
+            )
+            self.current_image_label.setToolTip(self.img_path)
+        else:
+            message = f"Saved: {saved_name}\n\nAll queued images have been saved." if saved_name else "No image queued for metadata"
+            self.current_image_label.setText(message)
+            self.current_image_label.setToolTip("")
     def save_metadata(self):
+        if not self.img_path or self.img_path not in self.staged:
+            QMessageBox.warning(self, "No Image", "Add an image before saving metadata.")
+            self._update_current_image()
+            return
         data = {
             "image_path": self.img_path,
             "name": self.name.text().strip() or "Unnamed Artifact",
@@ -1101,10 +1313,16 @@ class DataPage(QWidget):
         }
         run_query("INSERT INTO entries (image_path,name,writing_system,time_period,region,source)"
                   " VALUES (?,?,?,?,?,?)", list(data.values()))
-        self.name.clear(); self.start_yr.clear()
-        self.end_yr.clear(); self.region.clear()
-        self.reset_page()
-        self.goToLibrary.emit(data)
+        saved_path = self.img_path
+        saved_name = os.path.basename(saved_path)
+        if saved_path in self.staged:
+            self.staged.remove(saved_path)
+            self.queue_saved_count += 1
+        self.uploader.update_list(self.staged)
+        # Keep all metadata fields intact so the values can be adjusted for the
+        # next queued image instead of being entered again from scratch.
+        self._update_current_image(saved_name)
+        self.recordSaved.emit(data)
     def add_setting(self, key, combo):
         txt, ok = QInputDialog.getText(self, "Add New Entry", "Enter Value:")
         if ok and txt.strip() and txt.strip() not in self.settings[key]:
@@ -1113,7 +1331,10 @@ class DataPage(QWidget):
             save_settings(self.settings)
     def reset_page(self):
         self.staged.clear(); self.uploader.update_list([])
+        self.queue_saved_count = 0
         self.save_btn.setEnabled(False); self.p_box.hide(); self.img_path = ""
+        self.current_image_label.setText("No image queued for metadata")
+        self.current_image_label.setToolTip("")
 
 class LibraryPage(QWidget):
     def __init__(self):
@@ -1234,6 +1455,116 @@ class ChatBubble(QFrame):
         self._text += chunk
         self._lbl.setText(self._text)
 
+class CheckableImageComboBox(QComboBox):
+    """A compact checkbox selector with a synthetic Select All row."""
+    selectionChanged = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setEditable(True)
+        self.setMaxVisibleItems(10)
+        self.lineEdit().setReadOnly(True)
+        self.lineEdit().setPlaceholderText("Select library images...")
+        self.view().setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        self.view().setStyleSheet("""
+            QAbstractItemView { min-width: 420px; }
+            QScrollBar:vertical { background: #101010; width: 14px; margin: 0; }
+            QScrollBar::handle:vertical { background: #3b5f86; min-height: 28px; border-radius: 6px; margin: 2px; }
+            QScrollBar::handle:vertical:hover { background: #5682b2; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+        """)
+        self.view().pressed.connect(self._toggle_index)
+        self._updating_checks = False
+
+    def add_select_all(self):
+        self.addItem("Select All", userData="__select_all__")
+        self._set_check_state(0, Qt.CheckState.Unchecked)
+
+    def add_checkable_item(self, text, user_data):
+        self.addItem(text, userData=user_data)
+        self._set_check_state(self.count() - 1, Qt.CheckState.Unchecked)
+
+    def _set_check_state(self, row, state):
+        index = self.model().index(row, self.modelColumn(), self.rootModelIndex())
+        item_getter = getattr(self.model(), "item", None)
+        item = item_getter(row, self.modelColumn()) if callable(item_getter) else None
+        if item is not None:
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+        self.model().setData(index, state, Qt.ItemDataRole.CheckStateRole)
+
+    def _check_state(self, row):
+        index = self.model().index(row, self.modelColumn(), self.rootModelIndex())
+        value = self.model().data(index, Qt.ItemDataRole.CheckStateRole)
+        return Qt.CheckState(value) if value is not None else Qt.CheckState.Unchecked
+
+    def _toggle_index(self, index):
+        if self._updating_checks or not index.isValid():
+            return
+        row = index.row()
+        checked = self._check_state(row) == Qt.CheckState.Checked
+        self._updating_checks = True
+        try:
+            if row == 0 and self.itemData(0) == "__select_all__":
+                target = Qt.CheckState.Unchecked if checked else Qt.CheckState.Checked
+                for item_row in range(self.count()):
+                    self._set_check_state(item_row, target)
+            else:
+                self._set_check_state(row, Qt.CheckState.Unchecked if checked else Qt.CheckState.Checked)
+                self._sync_select_all_state()
+        finally:
+            self._updating_checks = False
+        self._update_summary()
+        self.selectionChanged.emit()
+
+    def _sync_select_all_state(self):
+        if self.count() <= 1 or self.itemData(0) != "__select_all__":
+            return
+        states = [self._check_state(row) for row in range(1, self.count())]
+        if states and all(state == Qt.CheckState.Checked for state in states):
+            state = Qt.CheckState.Checked
+        elif any(state == Qt.CheckState.Checked for state in states):
+            state = Qt.CheckState.PartiallyChecked
+        else:
+            state = Qt.CheckState.Unchecked
+        self._set_check_state(0, state)
+
+    def checked_data(self):
+        first_data_row = 1 if self.count() and self.itemData(0) == "__select_all__" else 0
+        return [self.itemData(row) for row in range(first_data_row, self.count())
+                if self._check_state(row) == Qt.CheckState.Checked and self.itemData(row)]
+
+    def checked_labels(self):
+        first_data_row = 1 if self.count() and self.itemData(0) == "__select_all__" else 0
+        return [self.itemText(row) for row in range(first_data_row, self.count())
+                if self._check_state(row) == Qt.CheckState.Checked]
+
+    def set_checked_by_data(self, value, checked=True):
+        for row in range(self.count()):
+            if self.itemData(row) == value:
+                self._set_check_state(row, Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+                self._sync_select_all_state()
+                self._update_summary()
+                self.selectionChanged.emit()
+                return True
+        return False
+
+    def _update_summary(self):
+        labels = self.checked_labels()
+        if not labels:
+            text = "Select library images..."
+        elif len(labels) == 1:
+            text = labels[0]
+        else:
+            text = f"{len(labels)} images selected"
+        self.lineEdit().setText(text)
+
+    def hidePopup(self):
+        # Keep the list open while users tick several rows.
+        if self.view().underMouse():
+            return
+        super().hidePopup()
+
 # ── AI Analysis Page ──────────────────────────────────────────────────────────
 
 class AIAnalysisPage(QWidget):
@@ -1277,6 +1608,11 @@ class AIAnalysisPage(QWidget):
         self._analysis_total_chunks = 0
         self._analysis_chunks_received = 0
         self._analysis_saved_count = 0
+        self._batch_analysis_queue = []
+        self._batch_analysis_total = 0
+        self._batch_analysis_completed = 0
+        self._batch_analysis_failures = []
+        self._batch_analysis_active = False
         self.setup_ui()
         self.status_timer = QTimer(self)
         self.status_timer.timeout.connect(self.check_ollama_status)
@@ -1377,13 +1713,13 @@ class AIAnalysisPage(QWidget):
         lay.addWidget(self._sec("IMAGE ANALYSIS FROM LIBRARY DATABASE"))
 
         sel_row = QHBoxLayout()
-        self.img_selector_combo = QComboBox()
+        self.img_selector_combo = CheckableImageComboBox()
         self.img_selector_combo.setMinimumWidth(200)
-        self.img_selector_combo.currentIndexChanged.connect(self._check_current_image_access)
+        self.img_selector_combo.selectionChanged.connect(self._check_current_image_access)
         refresh_img_btn = QPushButton("⟳")
         refresh_img_btn.setFixedWidth(30)
         refresh_img_btn.clicked.connect(self.refresh_library_images)
-        sel_row.addWidget(QLabel("Select Image:"))
+        sel_row.addWidget(QLabel("Select Images:"))
         sel_row.addWidget(self.img_selector_combo, 1)
         sel_row.addWidget(refresh_img_btn)
         lay.addLayout(sel_row)
@@ -1399,13 +1735,13 @@ class AIAnalysisPage(QWidget):
         self._access_timer.timeout.connect(self._update_access_timer)
         self._access_expiry = None
 
-        pipeline_lbl = QLabel("AI extraction: identify visible text, script clues, and transcription candidates")
+        pipeline_lbl = QLabel("AI extraction processes each checked library image separately and saves an independent result")
         pipeline_lbl.setWordWrap(True)
         pipeline_lbl.setStyleSheet("color: #777777; font-size: 10px;")
         lay.addWidget(pipeline_lbl)
 
         btn_row = QHBoxLayout()
-        analyse_btn = QPushButton("▶  Run AI Text Extraction")
+        analyse_btn = QPushButton("▶  Run AI Analysis on Selected")
         analyse_btn.setStyleSheet(
             "QPushButton { background: #0a1020; border: 1px solid #1a3060; color: #4488ff; font-weight: bold; padding: 6px; }"
             "QPushButton:hover { background: #0d1830; border-color: #2255aa; }"
@@ -1443,37 +1779,42 @@ class AIAnalysisPage(QWidget):
         """Browse and upload/select an image for the library analysis prompt."""
         path, _ = QFileDialog.getOpenFileName(self, "Select Image to Analyse", "", "Images (*.png *.jpg *.jpeg *.bmp *.gif)")
         if path:
-            for i in range(self.img_selector_combo.count()):
-                if self.img_selector_combo.itemData(i) == path:
-                    self.img_selector_combo.setCurrentIndex(i)
-                    self._check_current_image_access()
-                    return
+            if self.img_selector_combo.set_checked_by_data(path, True):
+                self._check_current_image_access()
+                return
             QMessageBox.information(self, "Image Not in Library",
                                     "The selected image is not in the library database.\n"
                                     "Please add it via the Data Entry page first.")
 
     def refresh_library_images(self):
+        selected_paths = set(self.img_selector_combo.checked_data())
         self.img_selector_combo.clear()
         rows = run_query("SELECT id, name, image_path FROM entries ORDER BY id", fetch=True)
+        if rows:
+            self.img_selector_combo.add_select_all()
         for row in rows:
             entry_id, name, img_path = row
             label = f"[{entry_id}] {name or 'Unnamed'} — {os.path.basename(img_path or '')}"
-            self.img_selector_combo.addItem(label, userData=img_path)
+            self.img_selector_combo.add_checkable_item(label, img_path)
+            if img_path in selected_paths:
+                self.img_selector_combo.set_checked_by_data(img_path, True)
         if self.img_selector_combo.count() == 0:
             self.img_selector_combo.addItem("No images in library", userData=None)
+        self.img_selector_combo._update_summary()
         self._check_current_image_access()
 
     def _check_current_image_access(self):
-        img_path = self.img_selector_combo.currentData()
-        if not img_path:
-            self.access_status_lbl.setText("Access: No image selected")
+        selected_paths = self.img_selector_combo.checked_data()
+        if not selected_paths:
+            self.access_status_lbl.setText("Access: No images selected")
             self.access_status_lbl.setStyleSheet("color: #555555; font-size: 10px;")
             return
-        if not os.path.exists(img_path):
-            self.access_status_lbl.setText("Access: File not found on disk")
+        missing = [path for path in selected_paths if not os.path.exists(path)]
+        if missing:
+            self.access_status_lbl.setText(f"Access: {len(missing)} of {len(selected_paths)} selected file(s) not found")
             self.access_status_lbl.setStyleSheet("color: #aa3333; font-size: 10px;")
-        elif PermissionManager.check_readable(img_path):
-            self.access_status_lbl.setText("Access: Readable ✓")
+        elif all(PermissionManager.check_readable(path) for path in selected_paths):
+            self.access_status_lbl.setText(f"Access: {len(selected_paths)} selected image(s) readable ✓")
             self.access_status_lbl.setStyleSheet("color: #33aa33; font-size: 10px;")
         else:
             self.access_status_lbl.setText("Access: Permission required")
@@ -2042,6 +2383,11 @@ class AIAnalysisPage(QWidget):
         self._analysis_total_chunks = 0
         self._analysis_chunks_received = 0
         self._analysis_saved_count = 0
+        self._batch_analysis_queue = []
+        self._batch_analysis_active = False
+        self._batch_analysis_failures = []
+        self._batch_analysis_total = 0
+        self._batch_analysis_completed = 0
         self._pipeline_record_ids = []
         self._pipeline_ai_json_path = ""
         self._pipeline_math_json_path = ""
@@ -2052,15 +2398,68 @@ class AIAnalysisPage(QWidget):
         self.analysis_stopped_state.emit(True)
         self.append_log("[Analysis] Stopped by user.")
 
-    def run_image_analysis(self):
-        img_path = self.img_selector_combo.currentData()
-        if not img_path or not os.path.exists(img_path):
-            QMessageBox.warning(self, "No Image", "Please select a valid image from the library.")
+    def _complete_batch_item(self, success=True, error=""):
+        current_path = self._current_pipeline_image_path
+        if self._batch_analysis_queue:
+            if not current_path or self._batch_analysis_queue[0] == current_path:
+                self._batch_analysis_queue.pop(0)
+            elif current_path in self._batch_analysis_queue:
+                self._batch_analysis_queue.remove(current_path)
+        self._batch_analysis_completed += 1
+        if not success:
+            self._batch_analysis_failures.append((current_path, error or "Analysis failed"))
+        if self._batch_analysis_queue and self._batch_analysis_active:
+            next_name = os.path.basename(self._batch_analysis_queue[0])
+            self.append_log(
+                f"[Batch] Completed {self._batch_analysis_completed} of {self._batch_analysis_total}. "
+                f"Starting next image: {next_name}"
+            )
+            QTimer.singleShot(0, self.run_image_analysis)
             return
+        total = self._batch_analysis_total
+        failures = len(self._batch_analysis_failures)
+        completed = self._batch_analysis_completed
+        self._batch_analysis_active = False
+        self._batch_analysis_queue = []
+        self.analyse_btn.setEnabled(True)
+        self.pause_btn.setEnabled(False)
+        self.stop_btn.setEnabled(False)
+        if failures:
+            details = "; ".join(
+                f"{os.path.basename(path or 'unknown')}: {message}" for path, message in self._batch_analysis_failures[:5]
+            )
+            self.append_log(f"[Batch] Finished {completed} of {total}; failures={failures}. {details}")
+        else:
+            self.append_log(f"[Batch] Successfully analysed {completed} image(s).")
+        self.progress_updated.emit(100 if completed > failures else 0)
+        self.analysis_completed.emit(completed > failures)
+
+    def run_image_analysis(self):
         if self._image_analysis_worker is not None and self._image_analysis_worker.isRunning():
             return
         if self._geometry_analysis_worker is not None and self._geometry_analysis_worker.isRunning():
             return
+        new_batch_paths = None
+        if not self._batch_analysis_active:
+            selected_paths = self.img_selector_combo.checked_data()
+            if not selected_paths:
+                QMessageBox.warning(self, "No Images", "Select one or more library images to analyse.")
+                return
+            missing = [path for path in selected_paths if not path or not os.path.exists(path)]
+            if missing:
+                QMessageBox.warning(
+                    self, "Missing Images",
+                    "Remove or restore these missing files before analysis:\n" +
+                    "\n".join(os.path.basename(path or "Unknown") for path in missing[:12])
+                )
+                return
+            new_batch_paths = list(dict.fromkeys(selected_paths))
+            img_path = new_batch_paths[0]
+        elif not self._batch_analysis_queue:
+            self._complete_batch_item(True)
+            return
+        else:
+            img_path = self._batch_analysis_queue[0]
 
         is_cloud = self._ai_mode == "cloud"
         if is_cloud:
@@ -2120,6 +2519,9 @@ class AIAnalysisPage(QWidget):
         self._analysis_paused = False
         self._analysis_stopped = False
         self._analysis_result_buffer = ""
+        self._analysis_total_chunks = 0
+        self._analysis_chunks_received = 0
+        self._analysis_saved_count = 0
         self._current_pipeline_image_path = img_path
         self._last_math_analysis_result = {}
         self._pipeline_completion_notified = False
@@ -2128,6 +2530,7 @@ class AIAnalysisPage(QWidget):
         self._pipeline_math_json_path = ""
         self._pipeline_overlay_path = ""
         self._image_analysis_started_at = None
+        self._pipeline_elapsed_seconds = 0
 
         concerns = []
         needs_permission = False
@@ -2135,9 +2538,9 @@ class AIAnalysisPage(QWidget):
             needs_permission = True
             concerns.append("• This file requires elevated permissions to read.")
 
-        if is_cloud:
-            concerns.append("• The image will be uploaded and sent to a third-party API server.")
-            concerns.append("• This means image data leaves your local machine temporarily.")
+        if is_cloud and new_batch_paths is not None:
+            concerns.append(f"• {len(new_batch_paths)} selected image(s) will be uploaded and sent to a third-party API server.")
+            concerns.append("• This means the selected image data leaves your local machine temporarily.")
             concerns.append("• Ensure you have rights to share this image with a third-party service.")
             concerns.append("• The selected cloud provider may log or retain your data per their privacy policy.")
             concerns.append("• Do NOT upload sensitive, personal, or confidential images.")
@@ -2169,6 +2572,14 @@ class AIAnalysisPage(QWidget):
             self.access_status_lbl.setText("Access: Temporary access granted ✓")
             self.access_status_lbl.setStyleSheet("color: #33aa33; font-size: 10px;")
 
+        if new_batch_paths is not None:
+            self._batch_analysis_queue = new_batch_paths
+            self._batch_analysis_total = len(new_batch_paths)
+            self._batch_analysis_completed = 0
+            self._batch_analysis_failures = []
+            self._batch_analysis_active = True
+            self.append_log(f"[Batch] Queued {self._batch_analysis_total} image(s) for AI analysis.")
+
         progress_data, progress_path = self._read_pipeline_progress(img_path)
         self._pipeline_progress_path = progress_path
         if progress_data and progress_data.get("status") != "complete":
@@ -2183,6 +2594,7 @@ class AIAnalysisPage(QWidget):
                 self.append_log(f"[Pipeline Resume] Completed report already exists: {pdf_path}")
                 self.progress_updated.emit(100)
                 self.elapsed_updated.emit(f"Analysis time: {self._format_elapsed(self._pipeline_elapsed_seconds)}")
+                self._complete_batch_item(True)
                 return
 
         self.analyse_btn.setEnabled(False)
@@ -2197,6 +2609,13 @@ class AIAnalysisPage(QWidget):
             "Analyse only the visible text, script, ancient text, glyphs, symbols, marks, and letter-like forms in this image. "
             "Do not translate unless a transcription is visibly supported. Do not identify unrelated artifact details except where they affect script extraction. "
             "Pay special attention to color contrast, ink/background contrast, and precise glyph border separation. "
+            "Treat every detected glyph as an independent vectorization candidate. Describe ambiguous joins, holes, detached diacritics, "
+            "damaged edges, and likely ligatures so the post-analysis vectorizer can preserve them. Do not invent pixel coordinates: after "
+            "your full semantic analysis, Pandu will deterministically trace each visible glyph into a closed editable anchor-point path, "
+            "calculate its geometry, and store that path for manual pen-tool correction in the AI Database. "
+            "In the vectorization guidance, list stable candidates G0, G1, G2... in reading order. For each candidate give an optional "
+            "probable glyph name, a normalized [left, top, width, height] box on a 0-to-1 scale, outer-border notes, inner-hole notes, "
+            "diacritic/compound status, uncertainty flags, and confidence. This is semantic guidance only; never fabricate pixel coordinates. "
             "Return structured extraction data with these headings:\n"
             "VISIBLE SCRIPT DETECTION:\n"
             "GLYPH / CHARACTER CANDIDATES:\n"
@@ -2205,11 +2624,13 @@ class AIAnalysisPage(QWidget):
             "WRITING SYSTEM CLUES:\n"
             "DAMAGED OR UNCERTAIN STROKES:\n"
             "CLEANING / SEGMENTATION NOTES:\n"
+            "GLYPH VECTORIZATION MANIFEST (G0..Gn, normalized boxes and semantic border guidance):\n"
             "CONFIDENCE:"
         )
 
         need_geometry = False
-        need_ai = not (self._pipeline_ai_json_path and os.path.exists(self._pipeline_ai_json_path))
+        need_ai = (not (self._pipeline_ai_json_path and os.path.exists(self._pipeline_ai_json_path)) or
+                   (progress_data or {}).get("status") == "vectorization_error")
 
         self._geometry_analysis_worker = None
 
@@ -2298,7 +2719,7 @@ class AIAnalysisPage(QWidget):
         self._write_pipeline_progress("timeout")
         if not (self._geometry_analysis_worker and self._geometry_analysis_worker.isRunning()):
             self._finish_pipeline_timer()
-            self.analyse_btn.setEnabled(True)
+            self.analyse_btn.setEnabled(not self._batch_analysis_active)
             self.pause_btn.setEnabled(False)
             self.stop_btn.setEnabled(False)
             self.pause_btn.setText("⏸  Pause")
@@ -2307,6 +2728,7 @@ class AIAnalysisPage(QWidget):
                 self._finish_ai_extraction_complete()
             else:
                 self.progress_updated.emit(0)
+                self._complete_batch_item(False, "AI analysis timed out")
 
     def _finish_ai_extraction_complete(self):
         self._ensure_ai_extraction_db_record()
@@ -2328,20 +2750,20 @@ class AIAnalysisPage(QWidget):
             except Exception as exc:
                 self.append_log(f"[Pipeline Progress Error] {exc}")
         self.append_log(f"[AI Extraction] Total analysis time: {self._format_elapsed(self._pipeline_elapsed_seconds)}")
-        self.analysis_completed.emit(True)
+        self._complete_batch_item(True)
 
     def _finished_image_analysis(self, success, err):
         self._image_analysis_timeout_timer.stop()
         self._image_analysis_started_at = None
         if not (self._geometry_analysis_worker and self._geometry_analysis_worker.isRunning()):
-            self.analyse_btn.setEnabled(True)
+            self.analyse_btn.setEnabled(not self._batch_analysis_active)
             self.pause_btn.setEnabled(False)
             self.stop_btn.setEnabled(False)
         self.pause_btn.setText("⏸  Pause")
         self._analysis_paused = False
         if success and not self._analysis_stopped:
             result = self._analysis_result_buffer or "Analysis completed"
-            img_path = self._current_pipeline_image_path or self.img_selector_combo.currentData() or ""
+            img_path = self._current_pipeline_image_path or next(iter(self.img_selector_combo.checked_data()), "")
             inferred_ws = ""
             lower_res = result.lower()
             for ws in load_settings().get("writing_systems", []):
@@ -2354,10 +2776,22 @@ class AIAnalysisPage(QWidget):
                 (os.path.basename(img_path), CURRENT_SETTINGS.get("active_model", ""), "N/A", result, "N/A",
                  "AI script/text extraction phase", inferred_ws, ""))
             ai_path = self._save_ai_extraction_result(img_path, result, inferred_ws)
+            self.append_log("[Vectorization] Semantic AI analysis complete. Tracing editable source-coordinate glyph paths...")
             trace_info = self._save_ai_traced_glyphs(img_path, record_id, inferred_ws)
             self._pipeline_record_ids.append(record_id)
             self._pipeline_ai_json_path = ai_path
+            if trace_info.get("status") == "error":
+                run_ai_query("UPDATE ai_analysis_db SET vectorization_status=? WHERE id=?", ("error", record_id))
+                self.append_log(f"[Vectorization Error] {trace_info.get('error', 'Editable outline generation failed')}")
+                self._write_pipeline_progress("vectorization_error")
+                self._finish_pipeline_controls_after_error()
+                self._complete_batch_item(False, trace_info.get("error", "Vectorization failed"))
+                return
             self._write_pipeline_progress("running")
+            run_ai_query(
+                "UPDATE ai_analysis_db SET vectorization_status=? WHERE id=?",
+                (trace_info.get("status", "complete"), record_id)
+            )
             if not (self._geometry_analysis_worker and self._geometry_analysis_worker.isRunning()):
                 self.progress_updated.emit(100)
                 self._finish_ai_extraction_complete()
@@ -2370,13 +2804,14 @@ class AIAnalysisPage(QWidget):
             self.append_log(f"[Analysis Error] {err}")
             self.progress_updated.emit(0)
             self._write_pipeline_progress("ai_error")
+            self._complete_batch_item(False, err or "AI analysis failed")
         self._analysis_total_chunks = 0
         self._analysis_chunks_received = 0
         self._analysis_saved_count = 0
 
     def _save_ai_traced_glyphs(self, img_path, record_id, writing_system):
         if not img_path or not os.path.exists(img_path):
-            return {"glyph_count": 0, "overlay_path": "", "report": {}}
+            return {"status": "error", "error": "Source image is missing", "glyph_count": 0, "overlay_path": "", "report": {}}
         try:
             analyzer = ScientificGlyphAnalyzer()
             phase1 = analyzer.phase1_clean_and_extract(img_path)
@@ -2389,6 +2824,12 @@ class AIAnalysisPage(QWidget):
             safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.splitext(os.path.basename(img_path))[0] or "image")
             source = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
             traces = []
+            overlay_path = os.path.join(math_dir, f"{stamp}_{safe_name}_ai_glyph_trace.png")
+            metadata = run_query(
+                "SELECT time_period, source, region FROM entries WHERE image_path=? ORDER BY id DESC LIMIT 1",
+                (img_path,), fetch=True
+            )
+            time_period, source_type, region = metadata[0] if metadata else ("", "", "")
 
             for idx, item in enumerate(per_glyph):
                 bbox = item.get("bbox", [])
@@ -2398,49 +2839,107 @@ class AIAnalysisPage(QWidget):
                 geometry = item.get("geometry", {}) if isinstance(item, dict) else {}
                 outline = geometry.get("outline_polygon", []) if isinstance(geometry, dict) else []
                 triangles = geometry.get("triangle_mesh", []) if isinstance(geometry, dict) else []
+                contour_paths = geometry.get("contour_paths", []) if isinstance(geometry, dict) else []
+                editable_geometry = calculate_editable_outline_geometry(outline)
+                if contour_paths:
+                    path_results = [
+                        (path, calculate_editable_outline_geometry(path.get("anchors", [])))
+                        for path in contour_paths if len(path.get("anchors", [])) >= 3
+                    ]
+                    if path_results:
+                        editable_geometry["area"] = max(0.0, round(sum(
+                            (-1 if path.get("role") == "hole" else 1) * result.get("area", 0)
+                            for path, result in path_results
+                        ), 6))
+                        editable_geometry["perimeter"] = round(sum(
+                            result.get("perimeter", 0) for _, result in path_results
+                        ), 6)
+                        boundary_points = [
+                            point for _, result in path_results for point in result.get("outline_polygon", [])
+                        ]
+                        if boundary_points:
+                            xs = [point[0] for point in boundary_points]; ys = [point[1] for point in boundary_points]
+                            editable_geometry["bbox"] = [
+                                min(xs), min(ys), max(xs) - min(xs) + 1, max(ys) - min(ys) + 1
+                            ]
+                        editable_geometry["angular_data"]["contours"] = [
+                            {"role": path.get("role", "outer"), **result.get("angular_data", {})}
+                            for path, result in path_results
+                        ]
+                        all_x, all_y = [], []
+                        for _, path_geometry in path_results:
+                            if all_x:
+                                all_x.append(None); all_y.append(None)
+                            all_x.extend(path_geometry.get("x_values", [])); all_y.extend(path_geometry.get("y_values", []))
+                        editable_geometry["x_values"], editable_geometry["y_values"] = all_x, all_y
+                        if any(path.get("role") == "hole" for path, _ in path_results):
+                            editable_geometry["triangle_mesh"] = []
+                            editable_geometry["angular_data"]["triangle_angles"] = []
+                canonical_bbox = editable_geometry.get("bbox", bbox) or bbox
                 glyph_path = os.path.join(glyph_dir, f"{stamp}_{safe_name}_ai_glyph_{idx}.png")
                 data_path = os.path.join(glyph_dir, f"{stamp}_{safe_name}_ai_glyph_{idx}.json")
-                self._write_precise_glyph_cutout(source, glyph_path, bbox, outline)
+                self._write_precise_glyph_cutout(source, glyph_path, canonical_bbox, outline, contour_paths)
                 data = {
                     "artifact_name": os.path.basename(img_path),
                     "source_image_path": img_path,
                     "ai_analysis_record_id": record_id,
                     "glyph_image_path": glyph_path,
                     "glyph_index": idx,
-                    "bbox": bbox,
+                    "bbox": canonical_bbox,
                     "area": item.get("morphological", {}).get("area", ""),
-                    "glyph_name": "",
+                    "ink_area_px": item.get("morphological", {}).get("area", 0),
+                    "vector_enclosed_area_px": editable_geometry.get("area", 0),
+                    "glyph_name": f"G{idx}",
                     "modern_equivalent": "",
                     "writing_system": writing_system,
                     "notes": "AI contrast-based precise glyph border trace.",
                     "geometric_data": {
                         "outline_polygon": outline,
-                        "triangle_mesh": triangles,
+                        "contour_paths": contour_paths,
+                        "triangle_mesh": editable_geometry.get("triangle_mesh", triangles),
                         "shape_vector": geometry.get("shape_vector", []),
                         "triangle_areas": geometry.get("triangle_areas", []),
-                        "triangle_angles": geometry.get("triangle_angles", []),
+                        "triangle_angles": editable_geometry.get("angular_data", {}).get("triangle_angles", []),
+                        "outline_vertex_angles": editable_geometry.get("angular_data", {}).get("outline_vertex_angles", []),
+                        "perimeter": editable_geometry.get("perimeter", 0),
+                        "orientation": editable_geometry.get("orientation", ""),
+                    },
+                    "vectorization": {
+                        "format": "editable-anchor-path-v1", "coordinate_space": "source-image-pixels",
+                        "origin": "top-left", "y_axis": "down", "closed": True, "editable": True,
+                        "revision": 1, "manually_edited": False, "source": "post-ai-deterministic-vectorization",
+                        "automatic_outline": editable_geometry.get("outline_polygon", outline),
+                        "contours": contour_paths,
+                        "automatic_contours": copy.deepcopy(contour_paths),
                     },
                     "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 }
                 with open(data_path, "w", encoding="utf-8") as f:
                     json.dump(data, f, indent=2)
+                x_values = editable_geometry.get("x_values", [])
+                y_values = editable_geometry.get("y_values", [])
+                angular_data = editable_geometry.get("angular_data", {})
                 run_ai_insert(
-                    "INSERT INTO ai_glyphs (artifact_name, source_image_path, glyph_image_path, glyph_data_path, glyph_index, bbox, glyph_name, modern_equivalent, writing_system, notes, created_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO ai_glyphs (artifact_name, source_image_path, glyph_image_path, glyph_data_path, glyph_index, bbox, glyph_name, modern_equivalent, writing_system, notes, created_at, analysis_overlay_path, glyph_area, angular_data, x_values, y_values, time_period, source, region, ai_analysis_record_id, vector_revision, ink_area_px, vector_enclosed_area_px, outline_perimeter_px)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
-                        os.path.basename(img_path), img_path, glyph_path, data_path, idx, json.dumps(bbox),
-                        "", "", writing_system, f"AI record {record_id}: contrast traced glyph border",
-                        datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        os.path.basename(img_path), img_path, glyph_path, data_path, idx, json.dumps(canonical_bbox),
+                        f"G{idx}", "", writing_system, f"AI record {record_id}: contrast traced glyph border",
+                        datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), overlay_path,
+                        float(editable_geometry.get("area", item.get("morphological", {}).get("area", 0)) or 0), json.dumps(angular_data),
+                        json.dumps(x_values), json.dumps(y_values), time_period, source_type, region, record_id, 1,
+                        float(item.get("morphological", {}).get("area", 0) or 0),
+                        float(editable_geometry.get("area", 0) or 0), float(editable_geometry.get("perimeter", 0) or 0)
                     )
                 )
                 traces.append({
                     "glyph_index": idx,
-                    "bbox": bbox,
+                    "bbox": canonical_bbox,
                     "outline_polygon": outline,
-                    "triangle_mesh": triangles,
+                    "contour_paths": contour_paths,
+                    "triangle_mesh": editable_geometry.get("triangle_mesh", triangles),
                 })
 
-            overlay_path = os.path.join(math_dir, f"{stamp}_{safe_name}_ai_glyph_trace.png")
             if traces:
                 render_glyph_trace_overlay(img_path, traces, overlay_path)
             summary = report.get("summary", {}) if isinstance(report, dict) else {}
@@ -2458,12 +2957,15 @@ class AIAnalysisPage(QWidget):
                     record_id
                 )
             )
-            return {"glyph_count": len(traces), "overlay_path": overlay_path, "report": report}
+            return {
+                "status": "complete" if traces else "no_glyphs",
+                "glyph_count": len(traces), "overlay_path": overlay_path, "report": report
+            }
         except Exception as exc:
             self.append_log(f"[AI Glyph Trace Error] {exc}")
-            return {"glyph_count": 0, "overlay_path": "", "report": {}}
+            return {"status": "error", "error": str(exc), "glyph_count": 0, "overlay_path": "", "report": {}}
 
-    def _write_precise_glyph_cutout(self, source, out_path, bbox, outline):
+    def _write_precise_glyph_cutout(self, source, out_path, bbox, outline, contour_paths=None):
         if source is None:
             return ""
         x, y, w, h = [int(v) for v in bbox]
@@ -2477,9 +2979,12 @@ class AIAnalysisPage(QWidget):
         else:
             crop_bgra = cv2.cvtColor(crop, cv2.COLOR_BGR2BGRA)
         alpha = np.zeros((h, w), dtype=np.uint8)
-        if outline:
-            local = np.array([[int(px) - x, int(py) - y] for px, py in outline], dtype=np.int32)
-            cv2.fillPoly(alpha, [local], 255)
+        paths = contour_paths or ([{"role": "outer", "anchors": outline}] if outline else [])
+        if paths:
+            for path in paths:
+                local = np.array([[int(px) - x, int(py) - y] for px, py in path.get("anchors", [])], dtype=np.int32)
+                if len(local) >= 3:
+                    cv2.fillPoly(alpha, [local], 0 if path.get("role") == "hole" else 255)
         else:
             alpha[:, :] = 255
         crop_bgra[:, :, 3] = alpha
@@ -2487,7 +2992,7 @@ class AIAnalysisPage(QWidget):
         return out_path
 
     def _finished_geometric_analysis(self, success, err, result):
-        img_path = self._current_pipeline_image_path or self.img_selector_combo.currentData() or ""
+        img_path = self._current_pipeline_image_path or next(iter(self.img_selector_combo.checked_data()), "")
         if success and not self._analysis_stopped:
             self._last_math_analysis_result = result or {}
             math_path = self._save_math_analysis_result(img_path, self._last_math_analysis_result)
@@ -2508,7 +3013,7 @@ class AIAnalysisPage(QWidget):
             self._pipeline_overlay_path = overlay_path
             self._write_pipeline_progress("running")
             if not (self._image_analysis_worker and self._image_analysis_worker.isRunning()):
-                self.analyse_btn.setEnabled(True)
+                self.analyse_btn.setEnabled(not self._batch_analysis_active)
                 self.pause_btn.setEnabled(False)
                 self.stop_btn.setEnabled(False)
                 self.progress_updated.emit(100)
@@ -2521,7 +3026,7 @@ class AIAnalysisPage(QWidget):
             self._write_pipeline_progress("geometry_error")
             if not (self._image_analysis_worker and self._image_analysis_worker.isRunning()):
                 self._finish_pipeline_timer()
-                self.analyse_btn.setEnabled(True)
+                self.analyse_btn.setEnabled(not self._batch_analysis_active)
                 self.pause_btn.setEnabled(False)
                 self.stop_btn.setEnabled(False)
                 self.progress_updated.emit(0)
@@ -2531,7 +3036,7 @@ class AIAnalysisPage(QWidget):
         self._image_analysis_started_at = None
         self._write_pipeline_progress("error")
         self._finish_pipeline_timer()
-        self.analyse_btn.setEnabled(True)
+        self.analyse_btn.setEnabled(not self._batch_analysis_active)
         self.pause_btn.setEnabled(False)
         self.stop_btn.setEnabled(False)
         self.pause_btn.setText("⏸  Pause")
@@ -2575,10 +3080,10 @@ class AIAnalysisPage(QWidget):
             self.append_log(f"[Pipeline] Total analysis time: {self._format_elapsed(self._pipeline_elapsed_seconds)}")
         else:
             self.append_log("[Pipeline PDF Error] No PDF report could be created.")
-        self.analysis_completed.emit(True)
+        self._complete_batch_item(True)
 
     def _generate_pipeline_pdf_report(self):
-        img_path = self._current_pipeline_image_path or self.img_selector_combo.currentData() or ""
+        img_path = self._current_pipeline_image_path or next(iter(self.img_selector_combo.checked_data()), "")
         if not img_path:
             return ""
         report_dir = ensure_ai_report_folder()
@@ -2657,7 +3162,7 @@ class AIAnalysisPage(QWidget):
             return ""
 
     def _generate_minimal_pipeline_pdf_report(self):
-        img_path = self._current_pipeline_image_path or self.img_selector_combo.currentData() or ""
+        img_path = self._current_pipeline_image_path or next(iter(self.img_selector_combo.checked_data()), "")
         if not img_path:
             return ""
         report_dir = ensure_ai_report_folder()
@@ -3023,17 +3528,52 @@ class GlyphTraceCanvas(QWidget):
         self.mode = "move"
         self.selected = None
         self._dragging = False
+        self._history = []
+        self._future = []
         self._pixmap = QPixmap(image_path)
         self.setMinimumSize(700, 520)
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
     def set_editing(self, enabled):
         self.editing = enabled
-        self.setCursor(Qt.CursorShape.CrossCursor if enabled else Qt.CursorShape.ArrowCursor)
+        if enabled:
+            self.set_mode(self.mode)
+            self.setFocus()
+        else:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
         self.update()
 
     def set_mode(self, mode):
         self.mode = mode
+        cursors = {"move": Qt.CursorShape.SizeAllCursor, "add": Qt.CursorShape.CrossCursor,
+                   "remove": Qt.CursorShape.ForbiddenCursor}
+        if self.editing:
+            self.setCursor(cursors.get(mode, Qt.CursorShape.CrossCursor))
+        self.update()
+
+    def _snapshot(self):
+        self._history.append(copy.deepcopy(self.traces))
+        if len(self._history) > 100:
+            self._history.pop(0)
+        self._future.clear()
+
+    def undo(self):
+        if not self._history:
+            return
+        self._future.append(copy.deepcopy(self.traces))
+        self.traces[:] = self._history.pop()
+        self.selected = None
+        self.tracesChanged.emit()
+        self.update()
+
+    def redo(self):
+        if not self._future:
+            return
+        self._history.append(copy.deepcopy(self.traces))
+        self.traces[:] = self._future.pop()
+        self.selected = None
+        self.tracesChanged.emit()
         self.update()
 
     def _image_rect(self):
@@ -3067,28 +3607,37 @@ class GlyphTraceCanvas(QWidget):
         best = None
         best_dist = max_dist
         for gi, trace in enumerate(self.traces):
-            poly = trace.get("outline_polygon", [])
-            for pi, point in enumerate(poly):
-                wp = self._image_to_widget(point)
-                dist = math.hypot(wp.x() - pos.x(), wp.y() - pos.y())
-                if dist < best_dist:
-                    best = (gi, pi)
-                    best_dist = dist
+            for ci, path in enumerate(self._trace_paths(trace)):
+                for pi, point in enumerate(path.get("anchors", [])):
+                    wp = self._image_to_widget(point)
+                    dist = math.hypot(wp.x() - pos.x(), wp.y() - pos.y())
+                    if dist < best_dist:
+                        best = (gi, ci, pi)
+                        best_dist = dist
         return best
+
+    @staticmethod
+    def _trace_paths(trace):
+        paths = trace.get("contour_paths", [])
+        if not paths:
+            paths = [{"role": "outer", "closed": True, "anchors": trace.setdefault("outline_polygon", [])}]
+            trace["contour_paths"] = paths
+        return paths
 
     def _nearest_edge_insert_index(self, pos):
         best = None
         best_dist = 999999.0
         for gi, trace in enumerate(self.traces):
-            poly = trace.get("outline_polygon", [])
-            if len(poly) < 2:
-                continue
-            for pi, p1 in enumerate(poly):
-                p2 = poly[(pi + 1) % len(poly)]
-                dist = self._distance_to_segment(pos, self._image_to_widget(p1), self._image_to_widget(p2))
-                if dist < best_dist:
-                    best = (gi, pi + 1)
-                    best_dist = dist
+            for ci, path in enumerate(self._trace_paths(trace)):
+                poly = path.get("anchors", [])
+                if len(poly) < 2:
+                    continue
+                for pi, p1 in enumerate(poly):
+                    p2 = poly[(pi + 1) % len(poly)]
+                    dist = self._distance_to_segment(pos, self._image_to_widget(p1), self._image_to_widget(p2))
+                    if dist < best_dist:
+                        best = (gi, ci, pi + 1)
+                        best_dist = dist
         return best if best_dist < 24 else None
 
     def _distance_to_segment(self, p, a, b):
@@ -3108,15 +3657,6 @@ class GlyphTraceCanvas(QWidget):
             painter.drawPixmap(rect, self._pixmap)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         for gi, trace in enumerate(self.traces):
-            poly = trace.get("outline_polygon", [])
-            if len(poly) < 2:
-                continue
-            points = [self._image_to_widget(p) for p in poly]
-            pen = QPen(QColor("#ffffff"), 2)
-            painter.setPen(pen)
-            for i, p1 in enumerate(points):
-                p2 = points[(i + 1) % len(points)]
-                painter.drawLine(p1, p2)
             painter.setPen(QPen(QColor("#00b4ff"), 1))
             for tri in trace.get("triangle_mesh", []):
                 if len(tri) == 3:
@@ -3124,11 +3664,29 @@ class GlyphTraceCanvas(QWidget):
                     painter.drawLine(tri_points[0], tri_points[1])
                     painter.drawLine(tri_points[1], tri_points[2])
                     painter.drawLine(tri_points[2], tri_points[0])
-            for pi, p in enumerate(points):
-                selected = self.selected == (gi, pi)
-                painter.setBrush(QBrush(QColor("#ffcc33" if selected else "#00ffff")))
-                painter.setPen(QPen(QColor("#111111"), 1))
-                painter.drawEllipse(p, 5 if selected else 4, 5 if selected else 4)
+            label_points = []
+            for ci, path in enumerate(self._trace_paths(trace)):
+                poly = path.get("anchors", [])
+                if len(poly) < 2:
+                    continue
+                points = [self._image_to_widget(p) for p in poly]
+                if path.get("role") == "hole":
+                    painter.setPen(QPen(QColor("#ff55cc"), 2, Qt.PenStyle.DashLine))
+                else:
+                    painter.setPen(QPen(QColor("#ffffff"), 2))
+                    label_points.extend(points)
+                for i, p1 in enumerate(points):
+                    painter.drawLine(p1, points[(i + 1) % len(points)])
+                for pi, point in enumerate(points):
+                    selected = self.selected == (gi, ci, pi)
+                    color = "#ffcc33" if selected else ("#ff55cc" if path.get("role") == "hole" else "#00ffff")
+                    painter.setBrush(QBrush(QColor(color)))
+                    painter.setPen(QPen(QColor("#111111"), 1))
+                    painter.drawEllipse(point, 5 if selected else 4, 5 if selected else 4)
+            if label_points:
+                anchor = min(label_points, key=lambda point: (point.y(), point.x()))
+                painter.setPen(QPen(QColor("#ffcc33"), 1))
+                painter.drawText(anchor + QPointF(7, -5), f"G{trace.get('glyph_index', gi)}")
         if not self.editing:
             painter.fillRect(QRect(12, 12, 240, 28), QColor(0, 0, 0, 170))
             painter.setPen(QColor("#dddddd"))
@@ -3144,9 +3702,11 @@ class GlyphTraceCanvas(QWidget):
         nearest = self._nearest_anchor(event.pos())
         if self.mode == "remove":
             if nearest:
-                gi, pi = nearest
-                if len(self.traces[gi].get("outline_polygon", [])) > 3:
-                    self.traces[gi]["outline_polygon"].pop(pi)
+                gi, ci, pi = nearest
+                polygon = self._trace_paths(self.traces[gi])[ci].get("anchors", [])
+                if len(polygon) > 3:
+                    self._snapshot()
+                    polygon.pop(pi)
                     self.selected = None
                     self.tracesChanged.emit()
                     self.update()
@@ -3154,14 +3714,17 @@ class GlyphTraceCanvas(QWidget):
         if self.mode == "add":
             insert_at = self._nearest_edge_insert_index(event.pos())
             if insert_at:
-                gi, idx = insert_at
-                self.traces[gi].setdefault("outline_polygon", []).insert(idx, img_point)
-                self.selected = (gi, idx)
+                gi, ci, idx = insert_at
+                self._snapshot()
+                self._trace_paths(self.traces[gi])[ci].setdefault("anchors", []).insert(idx, img_point)
+                self.selected = (gi, ci, idx)
                 self.tracesChanged.emit()
                 self.update()
             return
         self.selected = nearest
         self._dragging = bool(nearest)
+        if self._dragging:
+            self._snapshot()
         self.update()
 
     def mouseMoveEvent(self, event):
@@ -3170,14 +3733,47 @@ class GlyphTraceCanvas(QWidget):
         img_point = self._widget_to_image(event.pos())
         if img_point is None:
             return
-        gi, pi = self.selected
-        self.traces[gi]["outline_polygon"][pi] = img_point
+        gi, ci, pi = self.selected
+        self._trace_paths(self.traces[gi])[ci]["anchors"][pi] = img_point
         self.tracesChanged.emit()
         self.update()
 
     def mouseReleaseEvent(self, event):
         self._dragging = False
         super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        if not self.editing:
+            return super().keyPressEvent(event)
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier and event.key() == Qt.Key.Key_Z:
+            self.redo() if event.modifiers() & Qt.KeyboardModifier.ShiftModifier else self.undo()
+            return
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier and event.key() == Qt.Key.Key_Y:
+            self.redo()
+            return
+        if self.selected:
+            gi, ci, pi = self.selected
+            polygon = self._trace_paths(self.traces[gi])[ci].get("anchors", [])
+            if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and len(polygon) > 3:
+                self._snapshot()
+                polygon.pop(pi)
+                self.selected = None
+                self.tracesChanged.emit()
+                self.update()
+                return
+            deltas = {Qt.Key.Key_Left: (-1, 0), Qt.Key.Key_Right: (1, 0),
+                      Qt.Key.Key_Up: (0, -1), Qt.Key.Key_Down: (0, 1)}
+            if event.key() in deltas:
+                self._snapshot()
+                dx, dy = deltas[event.key()]
+                step = 10 if event.modifiers() & Qt.KeyboardModifier.ShiftModifier else 1
+                width = max(self._pixmap.width(), 1); height = max(self._pixmap.height(), 1)
+                polygon[pi] = [max(0, min(width - 1, polygon[pi][0] + dx * step)),
+                               max(0, min(height - 1, polygon[pi][1] + dy * step))]
+                self.tracesChanged.emit()
+                self.update()
+                return
+        super().keyPressEvent(event)
 
 class GlyphTraceEditorDialog(QDialog):
     def __init__(self, image_path, glyph_rows, overlay_path="", parent=None):
@@ -3186,18 +3782,36 @@ class GlyphTraceEditorDialog(QDialog):
         self.glyph_rows = glyph_rows
         self.overlay_path = overlay_path
         self.traces = self._load_traces()
+        self._persisted_traces = copy.deepcopy(self.traces)
+        self._automatic_traces = copy.deepcopy(self.traces)
+        for automatic in self._automatic_traces:
+            if automatic.get("automatic_contours"):
+                automatic["contour_paths"] = copy.deepcopy(automatic["automatic_contours"])
+                automatic_outer_paths = [path for path in automatic["contour_paths"] if path.get("role") != "hole"]
+                if automatic_outer_paths:
+                    automatic_outer = max(
+                        automatic_outer_paths,
+                        key=lambda path: calculate_editable_outline_geometry(path.get("anchors", [])).get("area", 0)
+                    )
+                    automatic["outline_polygon"] = automatic_outer["anchors"]
+            elif automatic.get("automatic_outline"):
+                automatic["outline_polygon"] = copy.deepcopy(automatic["automatic_outline"])
+            automatic_geometry = calculate_editable_outline_geometry(automatic.get("outline_polygon", []))
+            automatic["triangle_mesh"] = automatic_geometry.get("triangle_mesh", [])
+            automatic["bbox"] = automatic_geometry.get("bbox", automatic.get("bbox", []))
+        self._dirty = False
         self.setWindowTitle("AI Glyph Border Trace")
         self.resize(1000, 760)
         layout = QVBoxLayout(self)
 
         tool_row = QHBoxLayout()
-        self.edit_btn = QPushButton("Edit")
-        self.save_btn = QPushButton("Save")
+        self.edit_btn = QPushButton("✎ Edit Paths")
+        self.save_btn = QPushButton("Save Vector Changes")
         self.save_btn.setEnabled(False)
         self.mode_group = QButtonGroup(self)
-        self.move_btn = QPushButton("Move")
-        self.add_btn = QPushButton("Add Anchor")
-        self.remove_btn = QPushButton("Remove Anchor")
+        self.move_btn = QPushButton("A  Direct Select / Move")
+        self.add_btn = QPushButton("P  Pen / Add Anchor")
+        self.remove_btn = QPushButton("−  Delete Anchor")
         for btn in (self.move_btn, self.add_btn, self.remove_btn):
             btn.setCheckable(True)
             self.mode_group.addButton(btn)
@@ -3209,6 +3823,13 @@ class GlyphTraceEditorDialog(QDialog):
         tool_row.addWidget(self.move_btn)
         tool_row.addWidget(self.add_btn)
         tool_row.addWidget(self.remove_btn)
+        self.undo_btn = QPushButton("↶ Undo")
+        self.redo_btn = QPushButton("↷ Redo")
+        self.reset_btn = QPushButton("Reset Automatic Trace")
+        tool_row.addSpacing(12)
+        tool_row.addWidget(self.undo_btn)
+        tool_row.addWidget(self.redo_btn)
+        tool_row.addWidget(self.reset_btn)
         tool_row.addStretch()
         layout.addLayout(tool_row)
 
@@ -3218,8 +3839,15 @@ class GlyphTraceEditorDialog(QDialog):
         scroll.setWidget(self.canvas)
         layout.addWidget(scroll, 1)
 
+        self.help_label = QLabel(
+            "Pen: click near an outline segment to add an anchor  •  Direct Select: drag anchors; arrows nudge; Shift+arrows = 10 px  •  Delete: click an anchor  •  Ctrl+Z/Ctrl+Y: undo/redo"
+        )
+        self.help_label.setWordWrap(True)
+        self.help_label.setStyleSheet("color: #888888; font-size: 10px;")
+        layout.addWidget(self.help_label)
+
         close_btn = QPushButton("Close")
-        close_btn.clicked.connect(self.accept)
+        close_btn.clicked.connect(self._close_requested)
         layout.addWidget(close_btn, alignment=Qt.AlignmentFlag.AlignRight)
 
         self.edit_btn.clicked.connect(self._toggle_edit)
@@ -3227,7 +3855,43 @@ class GlyphTraceEditorDialog(QDialog):
         self.move_btn.clicked.connect(lambda: self.canvas.set_mode("move"))
         self.add_btn.clicked.connect(lambda: self.canvas.set_mode("add"))
         self.remove_btn.clicked.connect(lambda: self.canvas.set_mode("remove"))
-        self.canvas.tracesChanged.connect(lambda: self.save_btn.setEnabled(True))
+        self.undo_btn.clicked.connect(self.canvas.undo)
+        self.redo_btn.clicked.connect(self.canvas.redo)
+        self.reset_btn.clicked.connect(self._reset_automatic_trace)
+        self.canvas.tracesChanged.connect(self._mark_dirty)
+
+    def _mark_dirty(self):
+        self._dirty = True
+        self.save_btn.setEnabled(True)
+
+    def _reset_automatic_trace(self):
+        if QMessageBox.question(
+            self, "Reset Trace", "Discard the current edits and restore the automatically vectorized paths?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self.canvas._snapshot()
+        self.traces[:] = copy.deepcopy(self._automatic_traces)
+        self.canvas.selected = None
+        self._mark_dirty()
+        self.canvas.update()
+
+    def _close_requested(self):
+        if self._dirty and QMessageBox.question(
+            self, "Unsaved Vector Changes", "Close without saving the edited anchor paths?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self.accept()
+
+    def closeEvent(self, event):
+        if self._dirty and QMessageBox.question(
+            self, "Unsaved Vector Changes", "Close without saving the edited anchor paths?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        ) != QMessageBox.StandardButton.Yes:
+            event.ignore()
+            return
+        event.accept()
 
     def _load_traces(self):
         traces = []
@@ -3241,49 +3905,260 @@ class GlyphTraceEditorDialog(QDialog):
                 except Exception:
                     data = {}
             geom = data.get("geometric_data", {}) if isinstance(data, dict) else {}
+            outline = geom.get("outline_polygon", []) if isinstance(geom, dict) else []
+            fallback_contour_paths = []
+            if not outline:
+                try:
+                    xs = json.loads(row.get("x_values", "") or "[]")
+                    ys = json.loads(row.get("y_values", "") or "[]")
+                    segments, segment = [], []
+                    for x_value, y_value in zip(xs, ys):
+                        if x_value is None or y_value is None:
+                            if len(segment) >= 3:
+                                segments.append(segment)
+                            segment = []
+                        else:
+                            segment.append([int(x_value), int(y_value)])
+                    if len(segment) >= 3:
+                        segments.append(segment)
+                    if segments:
+                        outline = segments[0]
+                        fallback_contour_paths = [
+                            {"role": "outer" if index == 0 else "component", "closed": True, "anchors": points}
+                            for index, points in enumerate(segments)
+                        ]
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    outline = []
+            bbox = data.get("bbox", row.get("bbox", [])) if isinstance(data, dict) else row.get("bbox", [])
+            vector_meta = data.get("vectorization", {}) if isinstance(data, dict) else {}
+            coordinate_space = vector_meta.get("coordinate_space", "") if isinstance(vector_meta, dict) else ""
+            if fallback_contour_paths:
+                coordinate_space = "source-image-pixels"
+            contour_paths = geom.get("contour_paths", []) if isinstance(geom, dict) else []
+            if not contour_paths and isinstance(vector_meta, dict):
+                contour_paths = vector_meta.get("contours", [])
+            contour_paths = copy.deepcopy(contour_paths) if isinstance(contour_paths, list) else []
+            if not contour_paths and fallback_contour_paths:
+                contour_paths = fallback_contour_paths
+            # Older manually separated glyph JSON used crop-local coordinates.
+            if outline and len(bbox) == 4 and coordinate_space != "source-image-pixels" and not data.get("ai_analysis_record_id"):
+                bx, by, bw, bh = [int(v) for v in bbox]
+                if max(p[0] for p in outline) <= bw + 2 and max(p[1] for p in outline) <= bh + 2:
+                    outline = [[int(px) + bx, int(py) + by] for px, py in outline]
+                    for path in contour_paths:
+                        path["anchors"] = [[int(px) + bx, int(py) + by] for px, py in path.get("anchors", [])]
+            valid_paths = [
+                {"role": path.get("role", "outer"), "closed": True,
+                 "anchors": [[int(p[0]), int(p[1])] for p in path.get("anchors", []) if len(p) >= 2]}
+                for path in contour_paths if len(path.get("anchors", [])) >= 3
+            ]
+            outer_candidates = [path for path in valid_paths if path.get("role") != "hole"]
+            outer_path = (max(
+                outer_candidates,
+                key=lambda path: calculate_editable_outline_geometry(path.get("anchors", [])).get("area", 0)
+            ) if outer_candidates else None)
+            if outer_path is None:
+                outer_path = {"role": "outer", "closed": True, "anchors": outline}
+                valid_paths.insert(0, outer_path)
+            outline = outer_path["anchors"]
             traces.append({
                 "id": row.get("id"),
+                "glyph_index": row.get("glyph_index", len(traces)),
                 "glyph_data_path": data_path,
                 "glyph_image_path": row.get("glyph_image_path", ""),
-                "bbox": data.get("bbox", row.get("bbox", [])) if isinstance(data, dict) else row.get("bbox", []),
-                "outline_polygon": geom.get("outline_polygon", []),
+                "bbox": bbox,
+                "outline_polygon": outline,
+                "contour_paths": valid_paths,
                 "triangle_mesh": geom.get("triangle_mesh", []),
+                "vector_revision": int(row.get("vector_revision", 1) or 1),
+                "automatic_outline": copy.deepcopy(vector_meta.get("automatic_outline", outline)),
+                "automatic_contours": copy.deepcopy(vector_meta.get("automatic_contours", valid_paths)),
             })
         return traces
 
     def _toggle_edit(self):
         enabled = not self.canvas.editing
         self.canvas.set_editing(enabled)
-        self.edit_btn.setText("Editing" if enabled else "Edit")
+        self.edit_btn.setText("✎ Editing Paths" if enabled else "✎ Edit Paths")
         for btn in (self.move_btn, self.add_btn, self.remove_btn):
             btn.setEnabled(enabled)
 
     def save_changes(self):
+        saved = 0
+        failures = []
+        changed_parent_ids = set()
+        if not self.overlay_path:
+            base = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.splitext(os.path.basename(self.image_path))[0] or "image")
+            self.overlay_path = os.path.join(ensure_ai_glyph_folder(), f"{base}_edited_vector_overlay.png")
         for trace in self.traces:
             data_path = trace.get("glyph_data_path", "")
             if not data_path:
+                failures.append(f"Glyph {trace.get('glyph_index', '?')}: no JSON data file")
                 continue
             try:
-                trace["triangle_mesh"] = self._fan_triangles(trace.get("outline_polygon", []))
+                paths = self.canvas._trace_paths(trace)
+                path_geometries = []
+                for contour_index, path in enumerate(paths):
+                    path_geometry = calculate_editable_outline_geometry(path.get("anchors", []))
+                    if (len(path_geometry.get("outline_polygon", [])) < 3 or path_geometry.get("area", 0) <= 0 or
+                            not path_geometry.get("triangulation_complete", False)):
+                        raise ValueError(f"contour {contour_index} is degenerate, self-crossing, or has duplicate anchors")
+                    path_geometries.append((path, path_geometry))
+                outer_item = next(((path, item) for path, item in path_geometries if path.get("role") != "hole"), path_geometries[0])
+                geometry = outer_item[1]
+                if len(geometry.get("outline_polygon", [])) < 3 or geometry.get("area", 0) <= 0:
+                    raise ValueError("the edited path is degenerate or self-collapsed")
+                if not geometry.get("triangulation_complete", False):
+                    raise ValueError("the edited outline crosses itself or contains invalid duplicate anchors")
+                contour_records = []
+                net_area = 0.0
+                all_x, all_y = [], []
+                for path, path_geometry in path_geometries:
+                    role = path.get("role", "outer")
+                    net_area += (-1.0 if role == "hole" else 1.0) * path_geometry["area"]
+                    contour_records.append({
+                        "role": role, "closed": True, "anchors": path_geometry["outline_polygon"],
+                        "area": path_geometry["area"], "perimeter": path_geometry["perimeter"],
+                        "angular_data": path_geometry["angular_data"],
+                    })
+                    if all_x:
+                        all_x.append(None); all_y.append(None)
+                    all_x.extend(path_geometry["x_values"]); all_y.extend(path_geometry["y_values"])
+                    path["anchors"] = path_geometry["outline_polygon"]
+                geometry["area"] = max(0.0, round(net_area, 6))
+                geometry["perimeter"] = round(sum(item["perimeter"] for _, item in path_geometries), 6)
+                boundary_points = [point for _, item in path_geometries for point in item.get("outline_polygon", [])]
+                if boundary_points:
+                    xs = [point[0] for point in boundary_points]; ys = [point[1] for point in boundary_points]
+                    geometry["bbox"] = [min(xs), min(ys), max(xs) - min(xs) + 1, max(ys) - min(ys) + 1]
+                geometry["x_values"], geometry["y_values"] = all_x, all_y
+                geometry["contour_paths"] = contour_records
+                geometry["angular_data"]["contours"] = [
+                    {"role": record["role"], **record["angular_data"]} for record in contour_records
+                ]
+                if any(path.get("role") == "hole" for path, _ in path_geometries):
+                    # Do not display triangles through voids; outline angles remain exact.
+                    geometry["triangle_mesh"] = []
+                    geometry["angular_data"]["triangle_angles"] = []
+                trace["outline_polygon"] = geometry["outline_polygon"]
+                trace["contour_paths"] = [
+                    {"role": record["role"], "closed": True, "anchors": record["anchors"]}
+                    for record in contour_records
+                ]
+                trace["triangle_mesh"] = geometry["triangle_mesh"]
+                trace["bbox"] = geometry["bbox"]
                 data = {}
                 if os.path.exists(data_path):
                     with open(data_path, "r", encoding="utf-8") as f:
                         data = json.load(f)
                 data.setdefault("geometric_data", {})
-                data["geometric_data"]["outline_polygon"] = trace.get("outline_polygon", [])
-                data["geometric_data"]["triangle_mesh"] = trace.get("triangle_mesh", [])
-                bbox = self._bbox_from_polygon(trace.get("outline_polygon", []))
-                if bbox:
-                    data["bbox"] = bbox
-                    run_ai_query("UPDATE ai_glyphs SET bbox=? WHERE id=?", (json.dumps(bbox), trace.get("id")))
-                with open(data_path, "w", encoding="utf-8") as f:
+                data["geometric_data"].update({
+                    "outline_polygon": geometry["outline_polygon"],
+                    "contour_paths": trace["contour_paths"],
+                    "triangle_mesh": geometry["triangle_mesh"],
+                    "triangle_angles": geometry["angular_data"]["triangle_angles"],
+                    "outline_vertex_angles": geometry["angular_data"]["outline_vertex_angles"],
+                    "edge_lengths": geometry["edge_lengths"], "perimeter": geometry["perimeter"],
+                    "orientation": geometry["orientation"], "centroid": geometry["centroid"],
+                })
+                data["bbox"] = geometry["bbox"]
+                data["area"] = geometry["area"]
+                data["vector_enclosed_area_px"] = geometry["area"]
+                revision = int(trace.get("vector_revision", 1)) + 1
+                trace["vector_revision"] = revision
+                data["vectorization"] = {
+                    "format": "editable-anchor-path-v1", "coordinate_space": "source-image-pixels",
+                    "origin": "top-left", "y_axis": "down", "closed": True, "editable": True,
+                    "manually_edited": True, "revision": revision,
+                    "last_edited_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                    "automatic_outline": data.get("vectorization", {}).get(
+                        "automatic_outline", trace.get("automatic_outline", geometry["outline_polygon"])
+                    ),
+                    "contours": trace["contour_paths"],
+                    "automatic_contours": data.get("vectorization", {}).get(
+                        "automatic_contours", trace.get("automatic_contours", trace["contour_paths"])
+                    ),
+                }
+                temp_path = data_path + ".tmp"
+                with open(temp_path, "w", encoding="utf-8") as f:
                     json.dump(data, f, indent=2)
-            except Exception:
-                pass
-        if self.overlay_path:
-            render_glyph_trace_overlay(self.image_path, self.traces, self.overlay_path)
-        self.save_btn.setEnabled(False)
-        QMessageBox.information(self, "Trace Saved", "Edited glyph border anchors were saved.")
+                os.replace(temp_path, data_path)
+                self._regenerate_glyph_cutout(
+                    trace.get("glyph_image_path", ""), geometry["bbox"], geometry["outline_polygon"], trace["contour_paths"]
+                )
+                run_ai_query(
+                    "UPDATE ai_glyphs SET bbox=?, glyph_area=?, angular_data=?, x_values=?, y_values=?, vector_revision=?, analysis_overlay_path=?, vector_enclosed_area_px=?, outline_perimeter_px=? WHERE id=?",
+                    (json.dumps(geometry["bbox"]), geometry["area"], json.dumps(geometry["angular_data"]),
+                     json.dumps(geometry["x_values"]), json.dumps(geometry["y_values"]), revision,
+                     self.overlay_path, geometry["area"], geometry["perimeter"], trace.get("id"))
+                )
+                parent = data.get("ai_analysis_record_id")
+                if parent:
+                    changed_parent_ids.add(int(parent))
+                persisted_index = next(
+                    (index for index, item in enumerate(self._persisted_traces)
+                     if item.get("id") == trace.get("id") and trace.get("id") is not None),
+                    None
+                )
+                if persisted_index is None:
+                    persisted_index = next(
+                        (index for index, item in enumerate(self._persisted_traces)
+                         if item.get("glyph_index") == trace.get("glyph_index")),
+                        None
+                    )
+                if persisted_index is not None:
+                    self._persisted_traces[persisted_index] = copy.deepcopy(trace)
+                saved += 1
+            except Exception as exc:
+                failures.append(f"Glyph {trace.get('glyph_index', '?')}: {exc}")
+        if saved:
+            render_glyph_trace_overlay(self.image_path, self._persisted_traces, self.overlay_path)
+            for parent_id in changed_parent_ids:
+                totals = run_ai_query(
+                    "SELECT COUNT(*), COALESCE(SUM(glyph_area), 0) FROM ai_glyphs WHERE ai_analysis_record_id=?",
+                    (parent_id,), fetch=True
+                )
+                count, area = totals[0] if totals else (0, 0)
+                run_ai_query(
+                    "UPDATE ai_analysis_db SET analyzed_area_image_path=?, glyphs_detected=?, total_glyph_area_px=?, vectorization_status=? WHERE id=?",
+                    (self.overlay_path, int(count), float(area), "manually_edited", parent_id)
+                )
+        self._dirty = bool(failures)
+        self.save_btn.setEnabled(bool(failures))
+        self.canvas.update()
+        if failures:
+            QMessageBox.warning(
+                self, "Vector Save Incomplete",
+                f"Saved {saved} glyph path(s).\n\n" + "\n".join(failures[:12])
+            )
+        else:
+            QMessageBox.information(
+                self, "Vector Paths Saved",
+                f"Saved {saved} editable glyph path(s). Area, angles, X/Y values, cutouts, overlay, and aggregate totals were recalculated."
+            )
+
+    def _regenerate_glyph_cutout(self, out_path, bbox, outline, contour_paths=None):
+        if not out_path or not self.image_path or not os.path.exists(self.image_path):
+            return
+        source = cv2.imread(self.image_path, cv2.IMREAD_UNCHANGED)
+        if source is None or len(bbox) != 4:
+            return
+        x, y, w, h = [int(v) for v in bbox]
+        crop = source[y:y + h, x:x + w]
+        if crop.size == 0:
+            return
+        if crop.ndim == 2:
+            crop = cv2.cvtColor(crop, cv2.COLOR_GRAY2BGRA)
+        elif crop.shape[2] == 3:
+            crop = cv2.cvtColor(crop, cv2.COLOR_BGR2BGRA)
+        alpha = np.zeros((h, w), dtype=np.uint8)
+        paths = contour_paths or [{"role": "outer", "anchors": outline}]
+        for path in paths:
+            local = np.asarray([[int(px) - x, int(py) - y] for px, py in path.get("anchors", [])], dtype=np.int32)
+            if len(local) >= 3:
+                cv2.fillPoly(alpha, [local], 0 if path.get("role") == "hole" else 255)
+        crop[:, :, 3] = alpha
+        cv2.imwrite(out_path, crop)
 
     def _fan_triangles(self, polygon):
         if len(polygon) < 3:
@@ -3435,20 +4310,27 @@ class AIDatabasePage(QWidget):
         image_path = row[9] if len(row) > 9 else ""
         artifact = row[1] if len(row) > 1 else ""
         rows = []
-        if image_path:
+        analysis_record_id = row[0] if row else None
+        if analysis_record_id:
             rows = run_ai_query(
-                "SELECT id, glyph_image_path, glyph_data_path, glyph_index, bbox FROM ai_glyphs "
+                "SELECT id, glyph_image_path, glyph_data_path, glyph_index, bbox, x_values, y_values, vector_revision "
+                "FROM ai_glyphs WHERE ai_analysis_record_id=? ORDER BY glyph_index ASC, id ASC",
+                (analysis_record_id,), fetch=True
+            )
+        if image_path:
+            rows = rows or run_ai_query(
+                "SELECT id, glyph_image_path, glyph_data_path, glyph_index, bbox, x_values, y_values, vector_revision FROM ai_glyphs "
                 "WHERE source_image_path=? ORDER BY glyph_index ASC, id ASC",
                 (image_path,), fetch=True
             )
         if not rows and artifact:
             rows = run_ai_query(
-                "SELECT id, glyph_image_path, glyph_data_path, glyph_index, bbox FROM ai_glyphs "
+                "SELECT id, glyph_image_path, glyph_data_path, glyph_index, bbox, x_values, y_values, vector_revision FROM ai_glyphs "
                 "WHERE artifact_name=? ORDER BY glyph_index ASC, id ASC",
                 (artifact,), fetch=True
             )
         result = []
-        for gid, glyph_img, data_path, glyph_index, bbox in rows:
+        for gid, glyph_img, data_path, glyph_index, bbox, x_values, y_values, vector_revision in rows:
             try:
                 bbox_val = json.loads(bbox) if bbox else []
             except Exception:
@@ -3459,6 +4341,9 @@ class AIDatabasePage(QWidget):
                 "glyph_data_path": data_path or "",
                 "glyph_index": glyph_index,
                 "bbox": bbox_val,
+                "x_values": x_values or "",
+                "y_values": y_values or "",
+                "vector_revision": int(vector_revision or 1),
             })
         return result
 
@@ -3616,13 +4501,16 @@ class GeometricAnalysisPage(QWidget):
     def refresh_library_images(self):
         current = self.library_combo.currentData()
         self.library_combo.clear()
-        rows = run_query("SELECT id, name, image_path, writing_system FROM entries ORDER BY id DESC", fetch=True)
-        for entry_id, name, image_path, writing_system in rows:
+        rows = run_query("SELECT id, name, image_path, writing_system, time_period, region, source FROM entries ORDER BY id DESC", fetch=True)
+        for entry_id, name, image_path, writing_system, time_period, region, source in rows:
             if image_path and os.path.exists(image_path):
                 label = f"[{entry_id}] {name or os.path.basename(image_path)}"
                 if writing_system:
                     label += f" - {writing_system}"
-                self.library_combo.addItem(label, userData=(entry_id, name or os.path.basename(image_path), image_path, writing_system or ""))
+                self.library_combo.addItem(label, userData=(
+                    entry_id, name or os.path.basename(image_path), image_path,
+                    writing_system or "", time_period or "", region or "", source or ""
+                ))
         if current:
             for i in range(self.library_combo.count()):
                 if self.library_combo.itemData(i) == current:
@@ -3634,7 +4522,7 @@ class GeometricAnalysisPage(QWidget):
         if not data:
             QMessageBox.warning(self, "No Image", "Select a library image first.")
             return
-        _, artifact_name, image_path, _ = data
+        _, artifact_name, image_path, *_ = data
         if not image_path or not os.path.exists(image_path):
             QMessageBox.warning(self, "Image Missing", "The selected library image could not be found.")
             return
@@ -3722,19 +4610,49 @@ class GeometricAnalysisPage(QWidget):
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.splitext(os.path.basename(self._image_path))[0] or "image")
         out_path = os.path.join(glyph_dir, f"{stamp}_{safe_name}_glyph_{glyph.get('index', 0)}.json")
+        bbox = glyph.get("bbox", [])
+        bx, by = (int(bbox[0]), int(bbox[1])) if len(bbox) == 4 else (0, 0)
+        absolute_outline = [
+            [int(point[0]) + bx, int(point[1]) + by]
+            for point in (glyph.get("outline_polygon", []) or []) if len(point) >= 2
+        ]
+        absolute_contours = [
+            {"role": path.get("role", "outer"), "closed": True,
+             "anchors": [[int(px) + bx, int(py) + by] for px, py in path.get("anchors", [])]}
+            for path in (glyph.get("contour_paths", []) or []) if len(path.get("anchors", [])) >= 3
+        ]
+        editable_geometry = self._glyph_complete_geometry(glyph)
+        absolute_outline = editable_geometry.get("outline_polygon", absolute_outline)
+        absolute_contours = editable_geometry.get("contour_paths", absolute_contours)
         data = {
             "artifact_name": self._artifact_name,
             "source_image_path": self._image_path,
             "glyph_image_path": glyph_path,
             "glyph_index": glyph.get("index", 0),
-            "bbox": glyph.get("bbox", []),
-            "area": glyph.get("area", ""),
+            "bbox": editable_geometry.get("bbox", bbox),
+            "area": editable_geometry.get("area", glyph.get("area", "")),
+            "ink_area_px": int(np.count_nonzero(glyph.get("mask"))) if isinstance(glyph.get("mask"), np.ndarray) else glyph.get("area", 0),
+            "vector_enclosed_area_px": editable_geometry.get("area", 0),
             "aspect_ratio": glyph.get("aspect_ratio", ""),
             "solidity": glyph.get("solidity", ""),
+            "analysis_metrics": make_json_safe(glyph.get("analysis_metrics", {})),
             "geometric_data": {
-                "outline_polygon": glyph.get("outline_polygon", []),
-                "triangle_mesh": glyph.get("triangle_mesh", []),
+                "outline_polygon": editable_geometry.get("outline_polygon", []),
+                "contour_paths": absolute_contours,
+                "triangle_mesh": editable_geometry.get("triangle_mesh", []),
+                "outline_vertex_angles": editable_geometry.get("angular_data", {}).get("outline_vertex_angles", []),
+                "triangle_angles": editable_geometry.get("angular_data", {}).get("triangle_angles", []),
+                "edge_lengths": editable_geometry.get("edge_lengths", []),
+                "perimeter": editable_geometry.get("perimeter", 0),
                 "shape_signature": glyph.get("geometric_signature", {}),
+            },
+            "vectorization": {
+                "format": "editable-anchor-path-v1", "coordinate_space": "source-image-pixels",
+                "origin": "top-left", "y_axis": "down", "closed": True, "editable": True,
+                "revision": 1, "manually_edited": False, "source": "deterministic-geometric-vectorization",
+                "automatic_outline": editable_geometry.get("outline_polygon", []),
+                "contours": absolute_contours,
+                "automatic_contours": copy.deepcopy(absolute_contours),
             },
             "glyph_name": glyph_name,
             "modern_equivalent": modern_equiv,
@@ -3744,6 +4662,75 @@ class GeometricAnalysisPage(QWidget):
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
         return out_path
+
+    def _glyph_geometry_values(self, glyph):
+        """Return absolute trace coordinates and the triangle angle measurements."""
+        geometry = self._glyph_complete_geometry(glyph)
+        return geometry.get("outline_polygon", []), geometry.get("angular_data", {})
+
+    def _glyph_complete_geometry(self, glyph):
+        bbox = glyph.get("bbox", (0, 0, 0, 0))
+        bx, by = (int(bbox[0]), int(bbox[1])) if len(bbox) == 4 else (0, 0)
+        outline = glyph.get("outline_polygon", []) or []
+        absolute = [[int(point[0]) + bx, int(point[1]) + by] for point in outline if len(point) >= 2]
+        contour_paths = [
+            {"role": path.get("role", "outer"), "closed": True,
+             "anchors": [[int(px) + bx, int(py) + by] for px, py in path.get("anchors", [])]}
+            for path in (glyph.get("contour_paths", []) or []) if len(path.get("anchors", [])) >= 3
+        ]
+        if not contour_paths:
+            contour_paths = [{"role": "outer", "closed": True, "anchors": absolute}]
+        path_results = [(path, calculate_editable_outline_geometry(path["anchors"])) for path in contour_paths]
+        outer = next((result for path, result in path_results if path.get("role") != "hole"), path_results[0][1])
+        net_area = sum((-1 if path.get("role") == "hole" else 1) * result.get("area", 0)
+                       for path, result in path_results)
+        all_x, all_y = [], []
+        for _, result in path_results:
+            if all_x:
+                all_x.append(None); all_y.append(None)
+            all_x.extend(result.get("x_values", [])); all_y.extend(result.get("y_values", []))
+        outer["area"] = max(0.0, round(net_area, 6))
+        outer["perimeter"] = round(sum(result.get("perimeter", 0) for _, result in path_results), 6)
+        boundary_points = [point for _, result in path_results for point in result.get("outline_polygon", [])]
+        if boundary_points:
+            xs = [point[0] for point in boundary_points]; ys = [point[1] for point in boundary_points]
+            outer["bbox"] = [min(xs), min(ys), max(xs) - min(xs) + 1, max(ys) - min(ys) + 1]
+        outer["x_values"], outer["y_values"] = all_x, all_y
+        outer["contour_paths"] = contour_paths
+        outer["angular_data"]["contours"] = [
+            {"role": path.get("role", "outer"), **result.get("angular_data", {})}
+            for path, result in path_results
+        ]
+        if any(path.get("role") == "hole" for path in contour_paths):
+            outer["triangle_mesh"] = []
+            outer["angular_data"]["triangle_angles"] = []
+        return outer
+
+    def _write_geometric_overlay(self):
+        traces = []
+        for row, glyph in enumerate(self._glyphs):
+            outline, _ = self._glyph_geometry_values(glyph)
+            bbox = glyph.get("bbox", [0, 0, 0, 0])
+            bx, by = (int(bbox[0]), int(bbox[1])) if len(bbox) == 4 else (0, 0)
+            contour_paths = [
+                {"role": path.get("role", "outer"), "closed": True,
+                 "anchors": [[int(px) + bx, int(py) + by] for px, py in path.get("anchors", [])]}
+                for path in (glyph.get("contour_paths", []) or []) if len(path.get("anchors", [])) >= 3
+            ]
+            traces.append({
+                "glyph_index": glyph.get("index", row),
+                "bbox": list(glyph.get("bbox", [])),
+                "outline_polygon": outline,
+                "contour_paths": contour_paths,
+                "triangle_mesh": [
+                    [[int(px) + int(glyph.get("bbox", [0, 0])[0]), int(py) + int(glyph.get("bbox", [0, 0])[1])] for px, py in tri]
+                    for tri in (glyph.get("triangle_mesh", []) or []) if len(tri) == 3
+                ],
+            })
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.splitext(os.path.basename(self._image_path))[0] or "image")
+        out_path = os.path.join(ensure_ai_glyph_folder(), f"{stamp}_{safe_name}_geometric_overlay.png")
+        return render_glyph_trace_overlay(self._image_path, traces, out_path)
 
     def _generate_geometric_pdf_report(self, label_data, writing_system):
         report_dir = ensure_ai_report_folder()
@@ -3792,6 +4779,10 @@ class GeometricAnalysisPage(QWidget):
             return
         data = self.library_combo.currentData()
         writing_system = data[3] if data and len(data) > 3 else ""
+        time_period = data[4] if data and len(data) > 4 else ""
+        region = data[5] if data and len(data) > 5 else ""
+        source = data[6] if data and len(data) > 6 else ""
+        overlay_path = self._write_geometric_overlay()
         saved = 0
         label_data = []
         for row, glyph in enumerate(self._glyphs):
@@ -3803,19 +4794,29 @@ class GeometricAnalysisPage(QWidget):
             notes = notes_widget.text().strip() if isinstance(notes_widget, QLineEdit) else ""
             glyph_path = self._write_glyph_preview(glyph, preview=False)
             glyph_data_path = self._write_glyph_data_file(glyph, glyph_path, glyph_name, modern_equiv, notes)
-            bbox = json.dumps(glyph.get("bbox", []))
+            editable_geometry = self._glyph_complete_geometry(glyph)
+            outline = editable_geometry.get("outline_polygon", [])
+            angular_data = editable_geometry.get("angular_data", {})
+            bbox = json.dumps(editable_geometry.get("bbox", glyph.get("bbox", [])))
+            x_values = editable_geometry["x_values"]
+            y_values = editable_geometry["y_values"]
+            glyph_mask = glyph.get("mask")
+            ink_area = int(np.count_nonzero(glyph_mask)) if isinstance(glyph_mask, np.ndarray) else float(glyph.get("area", 0) or 0)
             run_ai_insert(
-                "INSERT INTO ai_glyphs (artifact_name, source_image_path, glyph_image_path, glyph_data_path, glyph_index, bbox, glyph_name, modern_equivalent, writing_system, notes, created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO ai_glyphs (artifact_name, source_image_path, glyph_image_path, glyph_data_path, glyph_index, bbox, glyph_name, modern_equivalent, writing_system, notes, created_at, analysis_overlay_path, glyph_area, angular_data, x_values, y_values, time_period, source, region, ink_area_px, vector_enclosed_area_px, outline_perimeter_px)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     self._artifact_name, self._image_path, glyph_path, glyph_data_path, glyph.get("index", row), bbox,
                     glyph_name, modern_equiv, writing_system, notes,
-                    datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), overlay_path,
+                    float(editable_geometry.get("area", glyph.get("area", 0)) or 0), json.dumps(angular_data), json.dumps(x_values),
+                    json.dumps(y_values), time_period, source, region, ink_area,
+                    float(editable_geometry.get("area", 0) or 0), float(editable_geometry.get("perimeter", 0) or 0)
                 )
             )
             label_data.append({
                 "glyph_index": glyph.get("index", row),
-                "bbox": glyph.get("bbox", []),
+                "bbox": editable_geometry.get("bbox", glyph.get("bbox", [])),
                 "glyph_name": glyph_name,
                 "modern_equivalent": modern_equiv,
                 "glyph_image_path": glyph_path,
@@ -3896,7 +4897,7 @@ class GeometricDatabasePage(QWidget):
         top.addStretch()
         root.addLayout(top)
 
-        root.addWidget(self._sec("GEOMETRIC PDF REPORTS"))
+        root.addWidget(self._sec("GEOMETRIC ANALYSIS REPORTS"))
         self.report_table = QTableWidget()
         self.report_table.setColumnCount(7)
         self.report_table.setHorizontalHeaderLabels(["PDF", "ID", "Artifact", "Glyphs", "Glyph Data Folder", "Created", "Notes"])
@@ -3906,14 +4907,17 @@ class GeometricDatabasePage(QWidget):
         self.report_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         root.addWidget(self.report_table, 2)
 
-        root.addWidget(self._sec("INDIVIDUAL GLYPH FILES"))
+        root.addWidget(self._sec("ANALYSED GLYPHS"))
         self.glyph_table = QTableWidget()
-        self.glyph_table.setColumnCount(8)
-        self.glyph_table.setHorizontalHeaderLabels(["Glyph", "ID", "Artifact", "Name", "Equivalent", "Image File", "JSON File", "Created"])
+        self.glyph_table.setColumnCount(15)
+        self.glyph_table.setHorizontalHeaderLabels([
+            "Analysis", "Glyph", "ID", "Artifact", "Glyph Name", "Ink Area px",
+            "Vector Area px", "Perimeter px", "Angular Data", "Time Period", "Source", "Region",
+            "X Values", "Y Values", "Created"
+        ])
         self.glyph_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        self.glyph_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self.glyph_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
-        self.glyph_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        self.glyph_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.glyph_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         self.glyph_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         root.addWidget(self.glyph_table, 3)
 
@@ -3946,13 +4950,29 @@ class GeometricDatabasePage(QWidget):
     def load_glyphs(self):
         self.glyph_table.setRowCount(0)
         rows = run_ai_query(
-            "SELECT id, artifact_name, glyph_image_path, glyph_data_path, glyph_name, modern_equivalent, created_at "
+            "SELECT id, artifact_name, glyph_image_path, glyph_data_path, glyph_name, created_at, "
+            "analysis_overlay_path, glyph_area, angular_data, x_values, y_values, time_period, source, region, "
+            "ink_area_px, vector_enclosed_area_px, outline_perimeter_px "
             "FROM ai_glyphs ORDER BY id DESC LIMIT 500",
             fetch=True
         )
         for data in rows:
             row = self.glyph_table.rowCount()
             self.glyph_table.insertRow(row)
+
+            overlay_path = data[6] or ""
+            analysis_btn = QPushButton("View")
+            analysis_btn.setFixedSize(58, 42)
+            analysis_btn.setToolTip("Open the analysed image with the geometric visualization layer")
+            if overlay_path and os.path.exists(overlay_path):
+                analysis_btn.setIcon(QIcon(overlay_path))
+                analysis_btn.setIconSize(QSize(48, 34))
+                analysis_btn.clicked.connect(lambda checked, p=overlay_path: self.show_image(p))
+            else:
+                analysis_btn.setEnabled(False)
+                analysis_btn.setToolTip("No geometric overlay is stored for this older record")
+            self.glyph_table.setCellWidget(row, 0, analysis_btn)
+
             glyph_label = QLabel()
             glyph_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             pix = QPixmap(data[2] or "")
@@ -3960,11 +4980,148 @@ class GeometricDatabasePage(QWidget):
                 glyph_label.setPixmap(pix.scaled(42, 42, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
             else:
                 glyph_label.setText("Glyph")
-            self.glyph_table.setCellWidget(row, 0, glyph_label)
-            values = [data[0], data[1], data[4], data[5], data[2], data[3], data[6]]
-            for col, value in enumerate(values, start=1):
+            self.glyph_table.setCellWidget(row, 1, glyph_label)
+
+            angular_data = self._decode_angular_json(data[8])
+            x_values = self._decode_json(data[9], [])
+            y_values = self._decode_json(data[10], [])
+            if isinstance(angular_data, dict):
+                contours = angular_data.get("contours", [])
+                outline_count = (sum(len(item.get("outline_vertex_angles", [])) for item in contours)
+                                 if contours else len(angular_data.get("outline_vertex_angles", [])))
+                angle_count = outline_count + len(angular_data.get("triangle_angles", [])) * 3
+            else:
+                angle_count = len(angular_data)
+            angle_btn = QPushButton(f"Angles ({angle_count})")
+            angle_btn.clicked.connect(lambda checked, a=angular_data: self.show_angular_data(a))
+            self.glyph_table.setCellWidget(row, 8, angle_btn)
+            x_btn = QPushButton(f"X ({sum(value is not None for value in x_values)})")
+            y_btn = QPushButton(f"Y ({sum(value is not None for value in y_values)})")
+            x_btn.clicked.connect(lambda checked, xs=x_values, ys=y_values: self.show_coordinates(xs, ys, "X Values"))
+            y_btn.clicked.connect(lambda checked, xs=x_values, ys=y_values: self.show_coordinates(xs, ys, "Y Values"))
+            self.glyph_table.setCellWidget(row, 12, x_btn)
+            self.glyph_table.setCellWidget(row, 13, y_btn)
+
+            values = {
+                2: data[0], 3: data[1], 4: data[4] or f"Glyph {data[0]}",
+                5: data[14] if data[14] is not None else data[7],
+                6: data[15] if data[15] is not None else data[7], 7: data[16],
+                9: data[11], 10: data[12], 11: data[13], 14: data[5]
+            }
+            for col, value in values.items():
                 self.glyph_table.setItem(row, col, QTableWidgetItem(str(value) if value is not None else ""))
-            self.glyph_table.setRowHeight(row, 48)
+            self.glyph_table.setRowHeight(row, 54)
+
+    @staticmethod
+    def _decode_json(value, default):
+        if isinstance(value, (list, dict)):
+            return value
+        try:
+            decoded = json.loads(value) if value else default
+            return decoded if isinstance(decoded, type(default)) else default
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return default
+
+    @staticmethod
+    def _decode_angular_json(value):
+        if isinstance(value, (dict, list)):
+            return value
+        try:
+            decoded = json.loads(value) if value else {}
+            return decoded if isinstance(decoded, (dict, list)) else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+
+    def _text_popup(self, title, text):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.resize(680, 560)
+        layout = QVBoxLayout(dialog)
+        viewer = QTextEdit()
+        viewer.setReadOnly(True)
+        viewer.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        viewer.setPlainText(text)
+        layout.addWidget(viewer, 1)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.accept)
+        layout.addWidget(close_btn)
+        dialog.exec()
+
+    def show_coordinates(self, x_values, y_values, title="Trace Coordinates"):
+        count = max(len(x_values), len(y_values))
+        lines = ["Point\tX\tY"]
+        for index in range(count):
+            x_value = x_values[index] if index < len(x_values) else ""
+            y_value = y_values[index] if index < len(y_values) else ""
+            if x_value is None and y_value is None:
+                lines.append("— next contour —")
+            else:
+                lines.append(f"{index}\t{x_value}\t{y_value}")
+        if count == 0:
+            lines.append("No traced coordinate values are stored for this glyph.")
+        self._text_popup(title, "\n".join(lines))
+
+    def show_angular_data(self, angular_data):
+        if isinstance(angular_data, list):
+            angular_data = {"units": "degrees", "outline_vertex_angles": [], "triangle_angles": angular_data}
+        angular_data = angular_data if isinstance(angular_data, dict) else {}
+        lines = [f"Units: {angular_data.get('units', 'degrees')}", ""]
+        vertex_angles = angular_data.get("outline_vertex_angles", [])
+        lines.append("OUTLINE ANCHOR ANGLES")
+        lines.append("Anchor\tX\tY\tInterior\tTurn")
+        for entry in vertex_angles:
+            point = entry.get("point", ["", ""])
+            point = list(point) + [""] * (2 - len(point))
+            lines.append(
+                f"{entry.get('anchor_index', '')}\t{point[0]}\t{point[1]}\t"
+                f"{entry.get('interior_angle_degrees', '')}\t{entry.get('turn_angle_degrees', '')}"
+            )
+        if not vertex_angles:
+            lines.append("No outline anchor angles stored (legacy record).")
+        contour_angles = angular_data.get("contours", [])
+        if contour_angles:
+            lines.extend(["", "ALL VECTOR CONTOURS (outer borders and holes)"])
+            for contour_index, contour in enumerate(contour_angles):
+                lines.append(f"Contour {contour_index} — {contour.get('role', 'outer')}")
+                lines.append("Anchor\tX\tY\tInterior\tTurn")
+                for entry in contour.get("outline_vertex_angles", []):
+                    point = list(entry.get("point", ["", ""])) + ["", ""]
+                    lines.append(
+                        f"{entry.get('anchor_index', '')}\t{point[0]}\t{point[1]}\t"
+                        f"{entry.get('interior_angle_degrees', '')}\t{entry.get('turn_angle_degrees', '')}"
+                    )
+        lines.extend(["", "TRIANGLE MESH ANGLES", "Triangle\tAngle A\tAngle B\tAngle C"])
+        triangle_angles = angular_data.get("triangle_angles", [])
+        for entry in triangle_angles:
+            angles = list(entry.get("angles_degrees", [])) if isinstance(entry, dict) else []
+            angles += [""] * (3 - len(angles))
+            lines.append(f"{entry.get('triangle', '')}\t{angles[0]}\t{angles[1]}\t{angles[2]}")
+        if not triangle_angles:
+            lines.append("No triangle angular measurements are stored for this glyph.")
+        if angular_data.get("interior_angle_sum_degrees") is not None:
+            lines.extend(["", f"Interior angle sum: {angular_data['interior_angle_sum_degrees']} degrees"])
+        self._text_popup("Glyph Angular Data (degrees)", "\n".join(lines))
+
+    def show_image(self, path):
+        if not path or not os.path.exists(path):
+            QMessageBox.warning(self, "Image Missing", "The geometric visualization image could not be found.")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Geometric Analysis Visualization")
+        dialog.resize(1000, 760)
+        layout = QVBoxLayout(dialog)
+        label = QLabel()
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pixmap = QPixmap(path)
+        label.setPixmap(pixmap) if not pixmap.isNull() else label.setText("Could not load image.")
+        scroll = QScrollArea()
+        scroll.setWidget(label)
+        scroll.setWidgetResizable(True)
+        layout.addWidget(scroll, 1)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.accept)
+        layout.addWidget(close_btn)
+        dialog.exec()
 
     def open_pdf_report(self, path):
         if not path or not os.path.exists(path):
@@ -4892,14 +6049,21 @@ class ScientificGlyphAnalyzer:
         
         valid_glyphs = []
         for i, cnt in enumerate(contours):
-            area = cv2.contourArea(cnt)
-            if area < min_area or area > max_area:
+            contour_area = cv2.contourArea(cnt)
+            if contour_area < min_area or contour_area > max_area:
                 continue
             
             x, y, w, h = cv2.boundingRect(cnt)
             
             # Extract the glyph sub-image from cleaned binary
-            glyph_mask = cleaned[y:y+h, x:x+w]
+            glyph_mask = cleaned[y:y+h, x:x+w].copy()
+            local_cnt = cnt.copy()
+            local_cnt[:, 0, 0] -= x
+            local_cnt[:, 0, 1] -= y
+            isolation_mask = np.zeros_like(glyph_mask)
+            cv2.drawContours(isolation_mask, [local_cnt], -1, 255, thickness=cv2.FILLED)
+            glyph_mask = cv2.bitwise_and(glyph_mask, isolation_mask)
+            ink_area = int(np.count_nonzero(glyph_mask))
             
             # Extract the glyph from the original grayscale
             glyph_gray = gray[y:y+h, x:x+w]
@@ -4912,18 +6076,15 @@ class ScientificGlyphAnalyzer:
             # Calculate solidity (area / convex hull area)
             hull = cv2.convexHull(cnt)
             hull_area = cv2.contourArea(hull)
-            solidity = float(area) / max(hull_area, 1) if hull_area > 0 else 0
-            
-            local_cnt = cnt.copy()
-            local_cnt[:, 0, 0] -= x
-            local_cnt[:, 0, 1] -= y
+            solidity = min(1.0, float(ink_area) / max(hull_area, 1)) if hull_area > 0 else 0
             polygon_model = self._polygonize_glyph(glyph_mask, local_cnt)
 
             valid_glyphs.append({
                 "index": len(valid_glyphs),
                 "bbox": (int(x), int(y), int(w), int(h)),
                 "center": (int(x + w/2), int(y + h/2)),
-                "area": int(area),
+                "area": ink_area,
+                "outer_contour_area": float(f"{contour_area:.3f}"),
                 "aspect_ratio": float(f"{aspect_ratio:.3f}"),
                 "solidity": float(f"{solidity:.3f}"),
                 "contour_points": cnt,
@@ -4931,6 +6092,7 @@ class ScientificGlyphAnalyzer:
                 "gray": glyph_gray,
                 "contour_simplified": cv2.approxPolyDP(cnt, 0.02 * cv2.arcLength(cnt, True), True),
                 "outline_polygon": polygon_model.get("outline_polygon", []),
+                "contour_paths": polygon_model.get("contour_paths", []),
                 "triangle_mesh": polygon_model.get("triangles", []),
                 "geometric_signature": polygon_model.get("signature", {}),
             })
@@ -4985,6 +6147,7 @@ class ScientificGlyphAnalyzer:
             polygon_model = self._polygonize_glyph(mask)
             outline = polygon_model.get("outline_polygon", [])
             triangles = polygon_model.get("triangles", [])
+            contour_paths = polygon_model.get("contour_paths", [])
             signature = polygon_model.get("signature", {})
             x, y, _, _ = glyph["bbox"]
 
@@ -4993,6 +6156,14 @@ class ScientificGlyphAnalyzer:
                 [[int(px + x), int(py + y)] for px, py in tri]
                 for tri in triangles
             ]
+            abs_contour_paths = [
+                {
+                    "role": path.get("role", "outer"), "closed": True,
+                    "anchors": [[int(px + x), int(py + y)] for px, py in path.get("anchors", [])],
+                }
+                for path in contour_paths if len(path.get("anchors", [])) >= 3
+            ]
+            editable_geometry = calculate_editable_outline_geometry(abs_outline)
 
             triangle_areas = [t.get("area", 0.0) for t in polygon_model.get("triangle_metrics", [])]
             triangle_angles = []
@@ -5025,11 +6196,18 @@ class ScientificGlyphAnalyzer:
                 "hole_count": signature.get("hole_count", 0),
                 "triangle_count": len(triangles),
                 "outline_polygon": abs_outline,
+                "contour_paths": abs_contour_paths,
                 "triangle_mesh": abs_triangles,
                 "triangle_areas_px": [float(f"{a:.2f}") for a in triangle_areas],
                 "avg_triangle_area": float(f"{np.mean(triangle_areas):.3f}") if triangle_areas else 0,
                 "std_triangle_area": float(f"{np.std(triangle_areas):.3f}") if len(triangle_areas) > 1 else 0,
                 "triangle_angles_deg": [float(f"{a:.1f}") for a in triangle_angles],
+                "angular_data": editable_geometry.get("angular_data", {}),
+                "x_values": editable_geometry.get("x_values", []),
+                "y_values": editable_geometry.get("y_values", []),
+                "vector_enclosed_area": editable_geometry.get("area", 0.0),
+                "editable_perimeter": editable_geometry.get("perimeter", 0.0),
+                "vector_bbox": editable_geometry.get("bbox", []),
                 "shape_vector": signature.get("shape_vector", []),
                 "complexity_score": float(f"{self._compute_polygon_complexity(signature, len(triangles)):.3f}"),
                 "elongation": float(f"{self._compute_elongation(mask):.3f}"),
@@ -5055,10 +6233,24 @@ class ScientificGlyphAnalyzer:
 
         binary = (mask > 0).astype(np.uint8) * 255
         h, w = binary.shape[:2]
+        all_contours, contour_hierarchy = cv2.findContours(binary, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        contour_paths = []
+        for contour_index, path_contour in enumerate(all_contours):
+            path_perimeter = cv2.arcLength(path_contour, True)
+            simplified = cv2.approxPolyDP(path_contour, max(1.0, 0.018 * path_perimeter), True).reshape(-1, 2)
+            if len(simplified) < 3:
+                continue
+            parent_index = int(contour_hierarchy[0][contour_index][3]) if contour_hierarchy is not None else -1
+            contour_paths.append({
+                "role": "hole" if parent_index >= 0 else "outer",
+                "closed": True,
+                "anchors": [[int(px), int(py)] for px, py in simplified],
+            })
         if contour is None:
-            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            contours = [c for i, c in enumerate(all_contours)
+                        if contour_hierarchy is None or contour_hierarchy[0][i][3] < 0]
             if not contours:
-                return {"outline_polygon": [], "triangles": [], "triangle_metrics": [], "signature": {}}
+                return {"outline_polygon": [], "contour_paths": [], "triangles": [], "triangle_metrics": [], "signature": {}}
             contour = max(contours, key=cv2.contourArea)
 
         perimeter = cv2.arcLength(contour, True)
@@ -5083,6 +6275,7 @@ class ScientificGlyphAnalyzer:
         signature = self._build_polygon_signature(binary, polygon, triangle_metrics)
         return {
             "outline_polygon": polygon,
+            "contour_paths": contour_paths,
             "triangles": triangles,
             "triangle_metrics": triangle_metrics,
             "signature": signature,
@@ -5298,9 +6491,15 @@ class ScientificGlyphAnalyzer:
                 },
                 "geometry": {
                     "outline_polygon": m["outline_polygon"],
+                    "contour_paths": m.get("contour_paths", []),
                     "triangle_mesh": m["triangle_mesh"],
                     "triangle_areas": m["triangle_areas_px"],
                     "triangle_angles": m["triangle_angles_deg"],
+                    "angular_data": m.get("angular_data", {}),
+                    "x_values": m.get("x_values", []),
+                    "y_values": m.get("y_values", []),
+                    "vector_enclosed_area": m.get("vector_enclosed_area", 0),
+                    "editable_perimeter": m.get("editable_perimeter", 0),
                     "shape_vector": m["shape_vector"],
                 }
             })
@@ -5461,6 +6660,16 @@ class ScientificGlyphAnalyzer:
             # Phase 2: Geometric analysis
             phase2 = self.phase2_geometric_analysis(phase1)
             result["phase2"] = phase2
+
+            # ML-ready glyph records complement the legacy polygon report.  Every
+            # candidate owns its mask/contour and standardized feature vector.
+            source_digest = hashlib.sha256(os.path.abspath(image_path).encode("utf-8")).hexdigest()[:12]
+            dataset_name = f"{re.sub(r'[^A-Za-z0-9_.-]+', '_', os.path.splitext(os.path.basename(image_path))[0])}_{source_digest}"
+            dataset_dir = os.path.join(ensure_ai_glyph_folder(), dataset_name)
+            structured = GlyphStructuralPipeline().analyze(image_path, output_dir=dataset_dir)
+            result["glyph_dataset"] = structured
+            result["segmentation_summary"] = structured["segmentation_summary"]
+            result["glyph_records"] = structured["glyphs"]
             
             result["status"] = "complete"
             result["report"] = phase2.get("overall_report", {})
@@ -6515,13 +7724,14 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         self.data_page = DataPage()
         self.library_page = LibraryPage()
+        # Keep the library model current after a save without changing pages.
+        self.data_page.recordSaved.connect(lambda _data: self.library_page.load_data())
         self.ai_analysis_page = AIAnalysisPage()
         self.ai_database_page = AIDatabasePage()
         self.geometric_analysis_page = GeometricAnalysisPage()
         self.geometric_database_page = GeometricDatabasePage()
         self.train_page = TrainPage()
         self.script_analysis_page = ScriptAnalysisPage()
-        self.data_page.goToLibrary.connect(self.saved_to_library)
         pages = [
             self.data_page, self.library_page, self.ai_analysis_page,
             self.ai_database_page, self.geometric_analysis_page,
@@ -6754,10 +7964,6 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         PermissionManager.revoke_all()
         super().closeEvent(event)
-
-    def saved_to_library(self, data):
-        self.library_page.load_data()
-        self.navigate("Library")
 
     def navigate(self, name):
         if name in self.pages:
